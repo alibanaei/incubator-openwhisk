@@ -165,7 +165,7 @@ case class WarmedData(override val container: Container,
 
 // Events received by the actor
 case class Start(exec: CodeExec[_], memoryLimit: ByteSize)
-case class Run(action: ExecutableWhiskAction, msg: ActivationMessage, retryLogDeadline: Option[Deadline] = None)
+case class Run(action: ExecutableWhiskAction, msg: ActivationMessage, retryLogDeadline: Option[Deadline] = None, time: Int = 0)
 case object Remove
 
 // Events sent by the actor
@@ -552,6 +552,18 @@ class ContainerProxy(
           .map(Some(_))
     }
 
+    var res = new WhiskActivation(
+      activationId = job.msg.activationId,
+      namespace = job.msg.user.namespace.name.toPath,
+      subject = job.msg.user.subject,
+      cause = job.msg.cause,
+      name = job.action.name,
+      version = job.action.version,
+      start = Instant.now(),
+      end = Instant.now()
+    )
+    var param:JsObject = null
+
     val activation: Future[WhiskActivation] = initialize
       .flatMap { initInterval =>
         //immediately setup warmedData for use (before first execution) so that concurrent actions can use it asap
@@ -559,6 +571,7 @@ class ContainerProxy(
           self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1))
         }
         val parameters = job.msg.content getOrElse JsObject.empty
+        param = parameters
 
         // if the action requests the api key to be injected into the action context, add it here;
         // treat a missing annotation as requesting the api key for backward compatibility
@@ -587,12 +600,15 @@ class ContainerProxy(
               val initRunInterval = initInterval
                 .map(i => Interval(runInterval.start.minusMillis(i.duration.toMillis), runInterval.end))
                 .getOrElse(runInterval)
-              ContainerProxy.constructWhiskActivation(
+
+              res = ContainerProxy.constructWhiskActivation(
                 job,
                 initInterval,
                 initRunInterval,
                 runInterval.duration >= actionTimeout,
                 response)
+
+              res
           }
       }
       .recover {
@@ -613,6 +629,17 @@ class ContainerProxy(
             false,
             ActivationResponse.whiskError(Messages.abnormalRun))
       }
+
+    activation.onComplete(ok => {
+      val limits = Map(
+        "concurrency" -> JsString(res.annotations.get("limits").get.asJsObject.fields("concurrency").toString),
+        "logs" -> JsString(res.annotations.get("limits").get.asJsObject.fields("logs").toString),
+        "memory" -> JsString(res.annotations.get("limits").get.asJsObject.fields("memory").toString),
+        "timeout" -> JsString(res.annotations.get("limits").get.asJsObject.fields("timeout").toString)
+      )
+      val result = new ResultProcess(res.namespace , res.name , res.activationId , JsObject(limits) , param , res.duration , logging)
+      result.putdb
+    })
 
     // Sending an active ack is an asynchronous operation. The result is forwarded as soon as
     // possible for blocking activations so that dependent activations can be scheduled. The

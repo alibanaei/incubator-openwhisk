@@ -241,7 +241,16 @@ class InvokerReactive(
             .flatMap { action =>
               action.toExecutableWhiskAction match {
                 case Some(executable) =>
-                  pool ! Run(executable, msg)
+                  val limits = Map(
+                    "concurrency" -> JsString(executable.limits.concurrency.maxConcurrent.toString),
+                    "logs" -> JsString(executable.limits.logs.megabytes.toString),
+                    "memory" -> JsString(executable.limits.memory.megabytes.toString),
+                    "timeout" -> JsString(executable.limits.timeout.millis.toString)
+                  )
+                  val resultProcess = new ResultProcess(executable.namespace , executable.name , msg.activationId , JsObject(limits) , msg.content getOrElse JsObject.empty , None , logging)
+                  val rTime = resultProcess.getTime
+                  pool ! Run(executable, msg , time = rTime)
+
                   Future.successful(())
                 case None =>
                   logging.error(this, s"non-executable action reached the invoker ${action.fullyQualifiedName(false)}")

@@ -1,0 +1,33 @@
+package org.apache.openwhisk.core.containerpool
+
+import akka.actor.Actor
+import org.apache.openwhisk.common.AkkaLogging
+import org.apache.openwhisk.core.database.CouchDbRestClient
+import spray.json.{JsObject, JsString}
+
+import scala.collection.immutable
+
+case class log(data: immutable.Map[String , immutable.Map[String , Any]])
+
+class DbSave extends Actor{
+  implicit val logging = new AkkaLogging(context.system.log)
+  implicit val ec =  scala.concurrent.ExecutionContext.global
+  val db = {
+    new CouchDbRestClient("http", "172.17.245.7", 5984, "scc", "IUST9572", "logging")(context.system , logging)
+  }
+
+  def receive: Receive = {
+    case log(data) =>
+      data.foreach(mylog => {
+        if(mylog._2.size == 4) {
+          val result = Map(
+            "namespace" -> JsString(mylog._2("namespace").toString),
+            "queueSize" -> JsString(mylog._2("queueSize").toString),
+            "start" -> JsString(mylog._2("start").toString),
+            "end" -> JsString(mylog._2("end").toString)
+          )
+          db.putDoc(mylog._1, JsObject(result))
+        }
+      })
+  }
+}
