@@ -8,12 +8,13 @@ import spray.json.{JsObject, JsString}
 import scala.collection.immutable
 
 case class log(data: immutable.Map[String , immutable.Map[String , Any]])
+case class throughPut(throughPut: immutable.Map[String , Any])
 
 class DbSave extends Actor{
   implicit val logging = new AkkaLogging(context.system.log)
   implicit val ec =  scala.concurrent.ExecutionContext.global
-  val db = {
-    new CouchDbRestClient("http", "172.17.245.7", 5984, "scc", "IUST9572", "logging")(context.system , logging)
+  val db = (dbName: String) => {
+    new CouchDbRestClient("http", "172.17.245.7", 5984, "scc", "IUST9572", dbName)(context.system , logging)
   }
 
   def receive: Receive = {
@@ -26,8 +27,18 @@ class DbSave extends Actor{
             "start" -> JsString(mylog._2("start").toString),
             "end" -> JsString(mylog._2("end").toString)
           )
-          db.putDoc(mylog._1, JsObject(result))
+          db("logging").putDoc(mylog._1, JsObject(result))
         }
       })
+
+    case throughPut(data) =>
+      val result = Map(
+        "end_time" -> JsString(data("endTime").toString),
+        "star_tTime" -> JsString(data("startTime").toString),
+        "job_count" -> JsString(data("job").toString)
+      )
+      val r = scala.util.Random
+      val id = "a_through_put/" + ((r.nextInt(1000)*r.nextInt(1000)) + (r.nextInt(1000)*r.nextInt(1000))).toString
+      db("through_put").putDoc(id, JsObject(result))
   }
 }

@@ -27,7 +27,7 @@ import scala.annotation.tailrec
 import scala.collection.immutable
 import scala.concurrent.duration._
 import scala.util.Try
-import scala.util.control.Breaks._
+//import scala.util.control.Breaks._
 
 sealed trait WorkerState
 case object Busy extends WorkerState
@@ -74,6 +74,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   val logMessageInterval = 10.seconds
 
   var mylog = immutable.Map.empty[String , immutable.Map[String , Any]]
+  var throughPutLog = immutable.Map.empty[String , Any]
+  var job = 0
   val state = "FCFS"
   var runBuffer1 = immutable.Queue.empty[Run]
   var lock : Run = _
@@ -125,6 +127,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   var temp = mylog(key)
                   temp += ("end" -> System.currentTimeMillis)
                   mylog = mylog.updated(key , temp)
+                }
+                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
+                  job += 1
                 }
 
                 // Schedule a job to a warm container
@@ -191,6 +196,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     val system = ActorSystem("dbsave")
                     val dbsave = system.actorOf(Props[DbSave] , "dbsave")
                     dbsave ! log(mylog)
+                    mylog = mylog.empty
+
+                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
+                    dbsave ! throughPut(throughPutLog)
+                    throughPutLog = throughPutLog.empty
+                    job = 0
                   }
 
                 }
@@ -219,6 +230,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   // Add this request to the buffer, as it is not there yet.
                   runBuffer = runBuffer.enqueue(r)
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
+                  throughPutLog += ("startTime" -> System.currentTimeMillis)
                 }
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)
@@ -232,19 +244,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
         case  "RR" =>
           // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
-
-          var queue = 0
-          var isLocked = false
-
-          if(runBuffer.nonEmpty && lock.msg == r.msg){
-            queue = 1
-            isLocked = true
-          }else if(runBuffer1.nonEmpty && lock.msg == r.msg){
-            queue = 2
-            isLocked = true
-          }
-
           val empty = runBuffer.isEmpty && runBuffer1.isEmpty
+          val isLocked = if(!empty && lock.msg == r.msg){
+            true
+          }else{
+            false
+          }
 
           // Only process request, if there are no other requests waiting for free slots, or if the current request is the
           // next request to process
@@ -259,6 +264,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   var temp = mylog(key)
                   temp += ("end" -> System.currentTimeMillis)
                   mylog = mylog.updated(key , temp)
+                }
+                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
+                  job += 1
                 }
 
                 // Schedule a job to a warm container
@@ -318,32 +326,32 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
                   // from the buffer
 
-                  queue match {
-                    case 0 =>
-                      runBuffer = runBuffer.dequeue._2
-
-                    case 1 =>
+                  if (runBuffer.nonEmpty && runBuffer.dequeueOption.exists(_._1.msg == r.msg)) {
+                    runBuffer = runBuffer.dequeue._2
+                  }
+                  else if (runBuffer1.nonEmpty && runBuffer1.dequeueOption.exists(_._1.msg == r.msg)){
                       runBuffer1 = runBuffer1.dequeue._2
                   }
 
-                  var turn = if(priority > 0 && runBuffer.nonEmpty){
+                  var turn = if((priority > 0 || runBuffer1.isEmpty) && runBuffer.nonEmpty){
                     1
                   }else if(runBuffer1.nonEmpty){
                     2
                   }else{
-                    3
+                    0
                   }
 
                   while (turn == 1){
-                    if (runBuffer.dequeue._1.time < 1000) {
+                    if (runBuffer.dequeue._1.time < 5000) {
                       lock = runBuffer.dequeue._1
                       self ! lock
                       priority -= 1
-                      break
-                    } else {
+                      turn = 0
+                    }
+                    else {
                       runBuffer1 = runBuffer1.enqueue(runBuffer.dequeue._1)
                       runBuffer = runBuffer.dequeue._2
-                      if(runBuffer.isEmpty){
+                      if (runBuffer.isEmpty){
                         turn = 2
                       }
                     }
@@ -352,12 +360,19 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   if(turn == 2){
                     lock = runBuffer1.dequeue._1
                     self ! lock
+                    priority = 5
                   }
 
-                  if(empty){
+                  if(runBuffer.isEmpty && runBuffer1.isEmpty){
                     val system = ActorSystem("dbsave")
                     val dbsave = system.actorOf(Props[DbSave] , "dbsave")
                     dbsave ! log(mylog)
+                    mylog = mylog.empty
+
+                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
+                    dbsave ! throughPut(throughPutLog)
+                    throughPutLog = throughPutLog.empty
+                    job = 0
                   }
 
                 }
@@ -382,10 +397,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 } else {
                   r.retryLogDeadline
                 }
-                if (!isResentFromBuffer) {
+                if (!isLocked) {
                   // Add this request to the buffer, as it is not there yet.
                   runBuffer = runBuffer.enqueue(r)
+                  lock = r
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
+                  throughPutLog += ("startTime" -> System.currentTimeMillis)
                 }
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)

@@ -81,7 +81,12 @@ class ResultProcess(namespace: EntityPath,
     val doc = Await.result(db.getDoc(generateID) , 20.seconds)
     doc match {
       case Right(response) =>
-        time = stringToInt(response.fields("totalTime").toString)
+        time = if(response.getFields(entryID).nonEmpty){
+                  stringToInt(response.fields(entryID).toString)
+                }
+                else{
+                  stringToInt(response.fields("totalTime").toString)
+                }
       case _ =>
 
     }
