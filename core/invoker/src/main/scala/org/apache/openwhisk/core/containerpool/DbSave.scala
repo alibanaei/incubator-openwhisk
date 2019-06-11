@@ -34,11 +34,16 @@ class DbSave extends Actor{
     case throughPut(data) =>
       val result = Map(
         "end_time" -> JsString(data("endTime").toString),
-        "star_tTime" -> JsString(data("startTime").toString),
+        "start_Time" -> JsString(data("startTime").toString),
         "job_count" -> JsString(data("job").toString)
       )
       val r = scala.util.Random
-      val id = "a_through_put/" + ((r.nextInt(1000)*r.nextInt(1000)) + (r.nextInt(1000)*r.nextInt(1000))).toString
-      db("through_put").putDoc(id, JsObject(result))
+      val id = (
+          (r.nextInt(10000)*r.nextInt(10000)) +
+          (r.nextInt(1000)*r.nextInt(1000)) +
+          (r.nextInt(100)*r.nextInt(100)) +
+          (r.nextInt(10)*r.nextInt(10))
+        ).toString
+      db("throughput").putDoc(id, JsObject(result))
   }
 }

@@ -76,8 +76,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var mylog = immutable.Map.empty[String , immutable.Map[String , Any]]
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
-  val state = "FCFS"
+  val state = "RR"
   var runBuffer1 = immutable.Queue.empty[Run]
+  var arrivalTime = immutable.Map.empty[String, Long]
+  var turnTime = immutable.Map.empty[String, Long]
   var lock : Run = _
   var priority = 0
 
@@ -333,7 +335,23 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                       runBuffer1 = runBuffer1.dequeue._2
                   }
 
-                  var turn = if((priority > 0 || runBuffer1.isEmpty) && runBuffer.nonEmpty){
+
+                  val threshold = 5000
+                  var overTime = false
+                  if(runBuffer1.nonEmpty){
+                    val actid = runBuffer1.dequeue._1.msg.activationId.toString
+                    val turnt = turnTime(actid)
+                    val exteraDelay = System.currentTimeMillis - turnt
+                    val delay = turnt - arrivalTime(actid)
+                    if((delay + exteraDelay) > (threshold*5)){
+                      overTime = true
+                      logging.info(this, s"alii runbuffersize = ${runBuffer1.size}")
+                      logging.info(this, s"alii delay = ${delay}")
+                      logging.info(this, s"alii exteraDelay = ${exteraDelay}")
+                    }
+                  }
+
+                  var turn = if((priority > 0 || runBuffer1.isEmpty) && runBuffer.nonEmpty && !overTime){
                     1
                   }else if(runBuffer1.nonEmpty){
                     2
@@ -341,15 +359,18 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     0
                   }
 
+
                   while (turn == 1){
-                    if (runBuffer.dequeue._1.time < 5000) {
+                    if (runBuffer.dequeue._1.time < threshold) {
                       lock = runBuffer.dequeue._1
                       self ! lock
                       priority -= 1
                       turn = 0
                     }
                     else {
-                      runBuffer1 = runBuffer1.enqueue(runBuffer.dequeue._1)
+                      val act = runBuffer.dequeue._1
+                      runBuffer1 = runBuffer1.enqueue(act)
+                      turnTime += (act.msg.activationId.toString -> System.currentTimeMillis)
                       runBuffer = runBuffer.dequeue._2
                       if (runBuffer.isEmpty){
                         turn = 2
@@ -373,6 +394,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! throughPut(throughPutLog)
                     throughPutLog = throughPutLog.empty
                     job = 0
+
+                    turnTime = turnTime.empty
+                    arrivalTime = arrivalTime.empty
                   }
 
                 }
@@ -400,6 +424,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 if (!isLocked) {
                   // Add this request to the buffer, as it is not there yet.
                   runBuffer = runBuffer.enqueue(r)
+                  arrivalTime += (r.msg.activationId.toString -> System.currentTimeMillis)
                   lock = r
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
                   throughPutLog += ("startTime" -> System.currentTimeMillis)
@@ -411,6 +436,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
             runBuffer = runBuffer.enqueue(r)
+            arrivalTime += (r.msg.activationId.toString -> System.currentTimeMillis)
             mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
           }
 
