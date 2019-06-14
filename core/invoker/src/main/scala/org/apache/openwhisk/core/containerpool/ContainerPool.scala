@@ -76,7 +76,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var mylog = immutable.Map.empty[String , immutable.Map[String , Any]]
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
-  val state = "RR"
+  val state = "FCFS"
   var runBuffer1 = immutable.Queue.empty[Run]
   var arrivalTime = immutable.Map.empty[String, Long]
   var turnTime = immutable.Map.empty[String, Long]
@@ -337,13 +337,15 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
 
                   val threshold = 5000
+                  val finerJob = 4
                   var overTime = false
                   if(runBuffer1.nonEmpty){
-                    val actid = runBuffer1.dequeue._1.msg.activationId.toString
+                    val headBuffer = runBuffer1.dequeue._1
+                    val actid = headBuffer.msg.activationId.toString
                     val turnt = turnTime(actid)
                     val exteraDelay = System.currentTimeMillis - turnt
                     val delay = turnt - arrivalTime(actid)
-                    if((delay + exteraDelay) > (threshold*5)){
+                    if(exteraDelay > (headBuffer.time/delay)*(threshold*finerJob)){
                       overTime = true
                       logging.info(this, s"alii runbuffersize = ${runBuffer1.size}")
                       logging.info(this, s"alii delay = ${delay}")
@@ -381,7 +383,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   if(turn == 2){
                     lock = runBuffer1.dequeue._1
                     self ! lock
-                    priority = 5
+                    priority = finerJob
                   }
 
                   if(runBuffer.isEmpty && runBuffer1.isEmpty){
