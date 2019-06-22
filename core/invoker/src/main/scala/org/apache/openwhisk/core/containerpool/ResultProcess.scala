@@ -38,6 +38,64 @@ class ResultProcess(namespace: EntityPath,
   def putdb {
     val doc = db.getDoc(generateID)
 
+    doc.map {
+      case Right(response) =>
+        var res = response.fields
+        if(res.get(entryID).nonEmpty) {
+          val oldData = res(entryID)
+          res -= entryID
+
+
+          val time = stringToInt(oldData.asJsObject.fields("time").toString)
+          val count = stringToInt(oldData.asJsObject.fields("count").toString)
+          val due = duration.getOrElse(0).toString.toLong
+          val newTime = ((time * count).toLong + due) / (count + 1)
+          val result = Map(
+            "time" -> JsString(newTime.toString),
+            "user" -> oldData.asJsObject.fields("user"),
+            "name" -> oldData.asJsObject.fields("name"),
+            "count" -> JsString((count + 1).toString)
+          )
+          res += (entryID -> JsObject(result))
+        }
+        else{
+          val result = Map(
+            "time" -> JsString(duration.getOrElse(0).toString),
+            "user" -> JsString(namespace.toString),
+            "name" -> JsString(name.name.toString),
+            "count" -> JsString(1.toString)
+          )
+          res += (entryID -> JsObject(result))
+        }
+        res -= "totalTime"
+        var count = 0
+        var time = 0
+        res.foreach(f => {
+          val c = stringToInt(f._2.asJsObject.fields("count").toString)
+          count += c
+
+          time += stringToInt(f._2.asJsObject.fields("time").toString) / c
+        })
+        res += ("totalTime" -> JsString((time/count).toString))
+
+        db.deleteDoc(res("_id").toString, res("_rev").toString).onComplete(f => {
+          db.putDoc(generateID , JsObject(res))
+        })
+
+      case _ =>
+
+        val parameters = Map(
+          "time" -> JsString(duration.getOrElse(0).toString),
+          "user" -> JsString(namespace.toString),
+          "name" -> JsString(name.name.toString),
+          "count" -> JsString(1.toString)
+        )
+
+        val result = JsObject(Map(entryID -> JsObject(parameters), "totalTime" -> parameters("time")))
+
+        db.putDoc(generateID , result)
+    }(ec)
+    /*
     doc.map{
       case Right(response) =>
         var newRes = response
@@ -73,23 +131,27 @@ class ResultProcess(namespace: EntityPath,
         val entry = Map(entryID -> time , "totalTime" -> time)
         db.putDoc(generateID , JsObject(entry))
     }(ec)
-
+    */
   }
 
   def getTime: Int ={
     var time = 0
+
     val doc = Await.result(db.getDoc(generateID) , 20.seconds)
     doc match {
       case Right(response) =>
-        time = if(response.getFields(entryID).nonEmpty){
-                  stringToInt(response.fields(entryID).toString)
+        val data = response.fields
+        time = if(data.get(entryID).nonEmpty){
+                  val res = data(entryID)
+                  stringToInt(res.asJsObject.fields("time").toString)
+                }else{
+                  stringToInt(data.get("totalTime").get.toString)
                 }
-                else{
-                  stringToInt(response.fields("totalTime").toString)
-                }
+
       case _ =>
 
     }
+
     time
   }
 
