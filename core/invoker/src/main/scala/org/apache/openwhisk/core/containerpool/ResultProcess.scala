@@ -36,15 +36,14 @@ class ResultProcess(namespace: EntityPath,
   }
 
   def putdb {
-    val doc = db.getDoc(generateID)
-
-    doc.map {
+    val doc = Await.result(db.getDoc(generateID), 20.seconds)
+    doc match {
       case Right(response) =>
         var res = response.fields
-        if(res.get(entryID).nonEmpty) {
+
+        if (res.get(entryID).nonEmpty) {
           val oldData = res(entryID)
           res -= entryID
-
 
           val time = stringToInt(oldData.asJsObject.fields("time").toString)
           val count = stringToInt(oldData.asJsObject.fields("count").toString)
@@ -58,7 +57,7 @@ class ResultProcess(namespace: EntityPath,
           )
           res += (entryID -> JsObject(result))
         }
-        else{
+        else {
           val result = Map(
             "time" -> JsString(duration.getOrElse(0).toString),
             "user" -> JsString(namespace.toString),
@@ -67,20 +66,21 @@ class ResultProcess(namespace: EntityPath,
           )
           res += (entryID -> JsObject(result))
         }
+
         res -= "totalTime"
         var count = 0
         var time = 0
-        res.foreach(f => {
-          val c = stringToInt(f._2.asJsObject.fields("count").toString)
-          count += c
+        res.foreach(field => {
+          if(field._1 != "_id" && field._1 != "_rev") {
+            val c = stringToInt(field._2.asJsObject.fields("count").toString)
+            count += c
 
-          time += stringToInt(f._2.asJsObject.fields("time").toString) / c
+            time += (stringToInt(field._2.asJsObject.fields("time").toString) * c)
+          }
         })
-        res += ("totalTime" -> JsString((time/count).toString))
+        res += ("totalTime" -> JsString((time / count).toString))
 
-        db.deleteDoc(res("_id").toString, res("_rev").toString).onComplete(f => {
-          db.putDoc(generateID , JsObject(res))
-        })
+        db.putDoc(generateID , JsObject(res))
 
       case _ =>
 
@@ -92,46 +92,8 @@ class ResultProcess(namespace: EntityPath,
         )
 
         val result = JsObject(Map(entryID -> JsObject(parameters), "totalTime" -> parameters("time")))
-
-        db.putDoc(generateID , result)
-    }(ec)
-    /*
-    doc.map{
-      case Right(response) =>
-        var newRes = response
-        if(response.getFields(entryID).nonEmpty){
-          val time = stringToInt(response.getFields(entryID)(0).toString)
-          val newTime = (duration.get.toInt + time) / 2
-          newRes = JsObject(newRes.fields + (entryID -> JsString(newTime.toString)))
-        }else{
-          newRes = JsObject(newRes.fields + (entryID -> JsString(duration.get.toString)))
-        }
-
-        if (response.getFields("totalTime").nonEmpty) {
-          var avg = 0
-          var total = 0
-
-          newRes.fields.foreach(field => {
-            if(field._1 != "_id" && field._1 != "_rev"){
-              avg += stringToInt(field._2.toString)
-              total += 1
-            }
-          })
-          val newTime = avg/total
-          newRes = JsObject(newRes.fields + ("totalTime" -> JsString(newTime.toString)))
-
-        } else {
-          newRes = JsObject(newRes.fields + ("totalTime" -> JsString(duration.get.toString)))
-        }
-
-        db.putDoc(generateID , newRes)
-
-      case _ =>
-        val time = JsString(duration.get.toInt.toString)
-        val entry = Map(entryID -> time , "totalTime" -> time)
-        db.putDoc(generateID , JsObject(entry))
-    }(ec)
-    */
+        db.putDoc(generateID, result)
+    }
   }
 
   def getTime: Int ={

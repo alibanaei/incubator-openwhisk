@@ -27,7 +27,6 @@ class DbSave extends Actor{
             "start" -> JsString(mylog._2("start").toString),
             "end" -> JsString(mylog._2("end").toString)
           )
-          logging.info(this, s"alii logging = ${result}")
           db("logging").putDoc(mylog._1, JsObject(result))
         }
       })
@@ -45,7 +44,6 @@ class DbSave extends Actor{
           (r.nextInt(100)*r.nextInt(100)) +
           (r.nextInt(10)*r.nextInt(10))
         ).toString
-      logging.info(this, s"alii throughput = ${result}")
       db("throughput").putDoc(id, JsObject(result))
   }
 }

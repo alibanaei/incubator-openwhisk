@@ -76,8 +76,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var mylog = immutable.Map.empty[String , immutable.Map[String , Any]]
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
-//  val state = "FCFS"
-  val state = "RR"
+  val state = "FCFS"
+//  val state = "RR"
 //  val state = "MLQ"
   var runBuffer1 = immutable.Queue.empty[Run]
 //  var arrivalTime = immutable.Map.empty[String, Long]
@@ -85,7 +85,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var lock : Run = _
   var priority = 0
   val threshold = 5000
-  val finerJob = 3
+  val finerJob = 4
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -354,7 +354,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 //                    }
 //                  }
 
-                  logging.info(this, s"alii priority = ${priority}")
                   var turn = if((priority > 0 || runBuffer1.isEmpty) && runBuffer.nonEmpty){
                     1
                   }else if(runBuffer1.nonEmpty){
@@ -362,7 +361,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   }else{
                     0
                   }
-
 
                   while (turn == 1){
                     if (runBuffer.dequeue._1.time < threshold) {
@@ -543,7 +541,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     0
                   }
 
-                  logging.info(this, s"alii turn = ${turn}")
                   if(turn == 1){
                     lock = runBuffer.dequeue._1
                     self ! lock
