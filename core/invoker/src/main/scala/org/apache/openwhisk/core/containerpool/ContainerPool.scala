@@ -27,7 +27,6 @@ import scala.annotation.tailrec
 import scala.collection.immutable
 import scala.concurrent.duration._
 import scala.util.Try
-//import scala.util.control.Breaks._
 
 sealed trait WorkerState
 case object Busy extends WorkerState
@@ -78,7 +77,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var job = 0
   val state = "FCFS"
 //  val state = "RR"
-//  val state = "MLQ"
+//  val state = "Priority"
   var runBuffer1 = immutable.Queue.empty[Run]
 //  var arrivalTime = immutable.Map.empty[String, Long]
 //  var turnTime = immutable.Map.empty[String, Long]
@@ -86,6 +85,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var priority = 0
   val threshold = 5000
   val finerJob = 4
+
+  var lAction = immutable.Queue.empty[Run]
+  var mAction = immutable.Queue.empty[Run]
+  var sAction = immutable.Queue.empty[Run]
+  var lTurn = 0
+  var mTurn = 0
+  var sTurn = 0
+  var turn = ""
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -442,14 +449,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
           }
 
-        case  "MLQ" =>
+        case  "Priority" =>
           // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
-          val empty = runBuffer.isEmpty && runBuffer1.isEmpty
-          val isLocked = if(!empty && lock.msg == r.msg){
-            true
-          }else{
-            false
-          }
+
+          val empty = sAction.isEmpty && mAction.isEmpty && lAction.isEmpty
+          val isLocked = !empty && lock.msg == r.msg
+
 
           // Only process request, if there are no other requests waiting for free slots, or if the current request is the
           // next request to process
@@ -521,39 +526,73 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   //update freePool to track counts
                   freePool = freePool + (actor -> newData)
                 }
+
+                actor ! r // forwards the run request to the container
+                logContainerStart(r, containerState, newData.activeActivationCount, container)
+
                 // Remove the action that get's executed now from the buffer and execute the next one afterwards.
                 if (isLocked) {
                   // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
                   // from the buffer
 
-                  if (runBuffer.nonEmpty && runBuffer.dequeueOption.exists(_._1.msg == r.msg)) {
-                    runBuffer = runBuffer.dequeue._2
-                  }
-                  else if (runBuffer1.nonEmpty && runBuffer1.dequeueOption.exists(_._1.msg == r.msg)){
-                    runBuffer1 = runBuffer1.dequeue._2
+                  turn match {
+                    case "large" =>
+                      val (_, newBuffer) = lAction.dequeue
+                      lAction = newBuffer
+                    case "medium" =>
+                      val (_, newBuffer) = mAction.dequeue
+                      mAction = newBuffer
+
+                    case "small" =>
+                      val (_, newBuffer) = sAction.dequeue
+                      sAction = newBuffer
                   }
 
-                  val turn = if((priority > 0 || runBuffer1.isEmpty) && runBuffer.nonEmpty){
-                    1
-                  }else if(runBuffer1.nonEmpty){
-                    2
-                  }else{
-                    0
-                  }
+                  val total = sAction.size + mAction.size + lAction.size
+                  if(total > 0){
+                    if((sTurn + mTurn + lTurn) == 0){
+                      if(total > 0){
+                        sTurn = if(sAction.nonEmpty){
+                          ((sAction.size * 10) / total) + 1
+                        }else{
+                          0
+                        }
+                        mTurn = if(mAction.nonEmpty){
+                          ((mAction.size * 10) / total) + 1
+                        }else{
+                          0
+                        }
+                        lTurn = if(lAction.nonEmpty){
+                          ((lAction.size * 10) / total) + 1
+                        }else{
+                          0
+                        }
+                      }
+                    }
 
-                  if(turn == 1){
-                    lock = runBuffer.dequeue._1
-                    self ! lock
-                    priority -= 1
+                    if(sTurn > 0){
+                      lock = sAction.dequeue._1
+                      sTurn -= 1
+                      turn = "small"
+                      self ! lock
+                    }
+                    else if(mTurn > 0){
+                      lock = mAction.dequeue._1
+                      mTurn -= 1
+                      turn = "medium"
+                      self ! lock
+                    }
+                    else if(lTurn > 0){
+                      lock = lAction.dequeue._1
+                      lTurn -= 1
+                      turn = "large"
+                      self ! lock
+                    }
+                    else{
+                      logging.info(this, s"alii ERROR!")
+                    }
                   }
-
-                  if(turn == 2){
-                    lock = runBuffer1.dequeue._1
-                    self ! lock
-                    priority = finerJob
-                  }
-
-                  if(runBuffer.isEmpty && runBuffer1.isEmpty){
+                  else{
                     val system = ActorSystem("dbsave")
                     val dbsave = system.actorOf(Props[DbSave] , "dbsave")
                     dbsave ! log(mylog)
@@ -564,10 +603,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     throughPutLog = throughPutLog.empty
                     job = 0
                   }
-
                 }
-                actor ! r // forwards the run request to the container
-                logContainerStart(r, containerState, newData.activeActivationCount, container)
+
               case None =>
                 // this can also happen if createContainer fails to start a new container, or
                 // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
@@ -589,37 +626,43 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 }
                 if (!isLocked) {
                   // Add this request to the buffer, as it is not there yet.
-                  if(r.time < threshold) {
-                    runBuffer = runBuffer.enqueue(r)
+                  if(r.time < 5000){
+                    sAction = sAction.enqueue(r)
+                    turn = "small"
+                  }
+                  else if(r.time < 20000){
+                    mAction = mAction.enqueue(r)
+                    turn = "medium"
                   }
                   else{
-                    if(runBuffer1.isEmpty){
-                      priority = finerJob
-                    }
-                    runBuffer1 = runBuffer1.enqueue(r)
+                    lAction = lAction.enqueue(r)
+                    turn = "large"
                   }
-
                   lock = r
+
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
                   throughPutLog += ("startTime" -> System.currentTimeMillis)
                 }
+
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)
             }
-          } else {
+          }
+          else {
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
-            if(r.time < threshold){
-              runBuffer = runBuffer.enqueue(r)
+
+            if(r.time < 5000){
+              sAction = sAction.enqueue(r)
+            }
+            else if(r.time < 20000){
+              mAction = mAction.enqueue(r)
             }
             else{
-              if(runBuffer1.isEmpty){
-                priority = finerJob
-              }
-              runBuffer1 = runBuffer1.enqueue(r)
+              lAction = lAction.enqueue(r)
             }
 
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
+            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (sAction.size + mAction.size + lAction.size) , "start" -> System.currentTimeMillis))
           }
       }
 
