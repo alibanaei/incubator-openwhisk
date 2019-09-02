@@ -536,53 +536,68 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   // from the buffer
 
                   turn match {
-                    case "large" =>
-                      val (_, newBuffer) = lAction.dequeue
-                      lAction = newBuffer
-                    case "medium" =>
-                      val (_, newBuffer) = mAction.dequeue
-                      mAction = newBuffer
-
                     case "small" =>
                       val (_, newBuffer) = sAction.dequeue
                       sAction = newBuffer
+                      if(sAction.isEmpty){
+                        sTurn = 0
+                      }
+
+                    case "medium" =>
+                      val (_, newBuffer) = mAction.dequeue
+                      mAction = newBuffer
+                      if(mAction.isEmpty){
+                        mTurn = 0
+                      }
+
+                    case "large" =>
+                      val (_, newBuffer) = lAction.dequeue
+                      lAction = newBuffer
+                      if(lAction.isEmpty){
+                        lTurn = 0
+                      }
                   }
 
                   val total = sAction.size + mAction.size + lAction.size
                   if(total > 0){
                     if((sTurn + mTurn + lTurn) == 0){
                       if(total > 0){
+                        val normal = if(total > 10){
+                          (total / 10) * 10
+                        }else{
+                          total
+                        }
                         sTurn = if(sAction.nonEmpty){
-                          ((sAction.size * 10) / total) + 1
+                          ((sAction.size * normal) / total) + 1
                         }else{
                           0
                         }
                         mTurn = if(mAction.nonEmpty){
-                          ((mAction.size * 10) / total) + 1
+                          ((mAction.size * normal) / total) + 1
                         }else{
                           0
                         }
                         lTurn = if(lAction.nonEmpty){
-                          ((lAction.size * 10) / total) + 1
+                          ((lAction.size * normal) / total) + 1
                         }else{
                           0
                         }
                       }
                     }
 
-                    if(sTurn > 0){
+                    if(sTurn > 0 && sAction.nonEmpty){
                       lock = sAction.dequeue._1
                       sTurn -= 1
                       turn = "small"
                       self ! lock
                     }
-                    else if(mTurn > 0){
+                    else if(mTurn > 0 && mAction.nonEmpty){
                       lock = mAction.dequeue._1
                       mTurn -= 1
                       turn = "medium"
                       self ! lock
                     }
-                    else if(lTurn > 0){
+                    else if(lTurn > 0 && lAction.nonEmpty){
                       lock = lAction.dequeue._1
                       lTurn -= 1
                       turn = "large"
