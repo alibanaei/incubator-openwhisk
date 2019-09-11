@@ -77,7 +77,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
 
-  val state = "FCFS"
+//  val state = "FCFS"
+  val state = "FCFS_2"
 //  val state = "MQS"
 
   var lock : Run = _
@@ -85,10 +86,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var quantum = 0
   var maxQuantum = 0
 
-  var actions = ListBuffer[Run]()
-  var sActions = ListBuffer[Run]()
-  var mActions = ListBuffer[Run]()
-  var lActions = ListBuffer[Run]()
+  case class act(r:Run, endTime:Long)
+  var actions = ListBuffer[act]()
+  var sActions = ListBuffer[act]()
+  var mActions = ListBuffer[act]()
+  var lActions = ListBuffer[act]()
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -251,6 +253,139 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
           }
 
+        case "FCFS_2" =>
+          // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
+          val isResentFromBuffer = actions.nonEmpty && actions.head.r.msg == r.msg
+
+          // Only process request, if there are no other requests waiting for free slots, or if the current request is the
+          // next request to process
+          // It is guaranteed, that only the first message on the buffer is resent.
+          if (actions.isEmpty || isResentFromBuffer) {
+            val createdContainer =
+            // Is there enough space on the invoker for this action to be executed.
+              if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
+
+                if(mylog.exists(_._1 == r.msg.activationId.toString)){
+                  val key = r.msg.activationId.toString
+                  var temp = mylog(key)
+                  temp += ("end" -> System.currentTimeMillis)
+                  mylog = mylog.updated(key , temp)
+                }
+                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
+                  job += 1
+                }
+
+                // Schedule a job to a warm container
+                ContainerPool
+                  .schedule(r.action, r.msg.user.namespace.name, freePool)
+                  .map(container => (container, container._2.initingState)) //warmed, warming, and warmingCold always know their state
+                  .orElse(
+                  // There was no warm/warming/warmingCold container. Try to take a prewarm container or a cold container.
+
+                  // Is there enough space to create a new container or do other containers have to be removed?
+                  if (hasPoolSpaceFor(busyPool ++ freePool, r.action.limits.memory.megabytes.MB)) {
+                    takePrewarmContainer(r.action)
+                      .map(container => (container, "prewarmed"))
+                      .orElse(Some(createContainer(r.action.limits.memory.megabytes.MB), "cold"))
+                  } else None)
+                  .orElse(
+                    // Remove a container and create a new one for the given job
+                    ContainerPool
+                      // Only free up the amount, that is really needed to free up
+                      .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB)
+                      .map(removeContainer)
+                      // If the list had at least one entry, enough containers were removed to start the new container. After
+                      // removing the containers, we are not interested anymore in the containers that have been removed.
+                      .headOption
+                      .map(_ =>
+                        takePrewarmContainer(r.action)
+                          .map(container => (container, "recreatedPrewarm"))
+                          .getOrElse(createContainer(r.action.limits.memory.megabytes.MB), "recreated")))
+
+              } else None
+
+            createdContainer match {
+              case Some(((actor, data), containerState)) =>
+                //increment active count before storing in pool map
+                val newData = data.nextRun(r)
+                val container = newData.getContainer
+
+                if (newData.activeActivationCount < 1) {
+                  logging.error(this, s"invalid activation count < 1 ${newData}")
+                }
+
+                //only move to busyPool if max reached
+                if (!newData.hasCapacity()) {
+                  if (r.action.limits.concurrency.maxConcurrent > 1) {
+                    logging.info(
+                      this,
+                      s"container ${container} is now busy with ${newData.activeActivationCount} activations")
+                  }
+                  busyPool = busyPool + (actor -> newData)
+                  freePool = freePool - actor
+                } else {
+                  //update freePool to track counts
+                  freePool = freePool + (actor -> newData)
+                }
+                // Remove the action that get's executed now from the buffer and execute the next one afterwards.
+                if (isResentFromBuffer) {
+                  // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
+                  // from the buffer
+                  actions.remove(0)
+                  if(actions.nonEmpty){
+                    actions = actions.sortBy(_.endTime)
+                    self ! actions.head.r
+                  }
+                  else{
+                    val system = ActorSystem("dbsave")
+                    val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                    dbsave ! log(mylog)
+                    mylog = mylog.empty
+
+                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
+                    dbsave ! throughPut(throughPutLog)
+                    throughPutLog = throughPutLog.empty
+                    job = 0
+                  }
+
+                }
+                actor ! r // forwards the run request to the container
+                logContainerStart(r, containerState, newData.activeActivationCount, container)
+              case None =>
+                // this can also happen if createContainer fails to start a new container, or
+                // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
+                // (and a new container would over commit the pool)
+                val isErrorLogged = r.retryLogDeadline.map(_.isOverdue).getOrElse(true)
+                val retryLogDeadline = if (isErrorLogged) {
+                  logging.error(
+                    this,
+                    s"Rescheduling Run message, too many message in the pool, " +
+                      s"freePoolSize: ${freePool.size} containers and ${memoryConsumptionOf(freePool)} MB, " +
+                      s"busyPoolSize: ${busyPool.size} containers and ${memoryConsumptionOf(busyPool)} MB, " +
+                      s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
+                      s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
+                      s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
+                      s"waiting messages: ${runBuffer.size}")(r.msg.transid)
+                  Some(logMessageInterval.fromNow)
+                } else {
+                  r.retryLogDeadline
+                }
+                if (!isResentFromBuffer) {
+                  // Add this request to the buffer, as it is not there yet.
+                  actions += act(r, System.currentTimeMillis() + r.time)
+                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> actions.size , "start" -> System.currentTimeMillis))
+                  throughPutLog += ("startTime" -> System.currentTimeMillis)
+                }
+                // As this request is the first one in the buffer, try again to execute it.
+                self ! Run(r.action, r.msg, retryLogDeadline , r.time)
+            }
+          } else {
+            // There are currently actions waiting to be executed before this action gets executed.
+            // These waiting actions were not able to free up enough memory.
+            actions += act(r, System.currentTimeMillis() + r.time)
+            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> actions.size , "start" -> System.currentTimeMillis))
+          }
+
         case  "MQS" =>
           // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
           val empty = actions.isEmpty && sActions.isEmpty && mActions.isEmpty && lActions.isEmpty
@@ -339,155 +474,146 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   turn match {
                     case "main" =>
                       actions.remove(0)
-                      if(quantum > 0 && actions.nonEmpty){
-                        lock = actions.head
-                        self ! lock
-                      }else{
-                        quantum = 0
-                      }
+                      quantum = 0
 
                     case "small" =>
                       sActions.remove(0)
-                      if(quantum > 0 && sActions.nonEmpty){
-                        lock = sActions.head
-                        self ! lock
-                      }else{
+                      if(sActions.isEmpty){
                         quantum = 0
                       }
 
                     case "medium" =>
                       mActions.remove(0)
-                      if(quantum > 0 && mActions.nonEmpty){
-                        lock = mActions.head
-                        self ! lock
-                      }else{
+                      if(mActions.isEmpty){
                         quantum = 0
                       }
 
                     case "large" =>
                       lActions.remove(0)
-                      if(quantum > 0 && lActions.nonEmpty){
-                        lock = lActions.head
-                        self ! lock
-                      }else{
+                      if(lActions.isEmpty){
                         quantum = 0
                       }
                   }
 
-                  if(quantum <= 0){
-                    var choose = ""
-                    if(turn == "small"){
-                      if(mActions.nonEmpty) {
-                        choose = "medium"
-                      }
-                      else if(lActions.nonEmpty){
-                        choose = "large"
-                      }
-                      else if(sActions.nonEmpty){
-                        choose = "small"
-                      }
-                      else if(actions.nonEmpty){
-                        choose = "main"
-                      }
+                  if(actions.nonEmpty && sActions.isEmpty && mActions.isEmpty && lActions.isEmpty){
+                    val size = actions.size
+                    actions = actions.sortBy(_.endTime)
+                    val forty = if(size == 1 || size == 2){
+                      1
                     }
-                    if(turn == "medium"){
-                      if(lActions.nonEmpty) {
-                        choose = "large"
-                      }
-                      else if(sActions.nonEmpty){
-                        choose = "small"
-                      }
-                      else if(mActions.nonEmpty){
-                        choose = "medium"
-                      }
-                      else if(actions.nonEmpty){
-                        choose = "main"
-                      }
+                    else if(size % 2 == 0){
+                      (size * 0.4).toInt
+                    }else{
+                      (size * 0.4).toInt + 1
                     }
-                    if(turn == "large"){
-                      if(sActions.nonEmpty) {
-                        choose = "small"
+                    for(i <- 0 until size){
+                      if(i < forty){
+                        sActions += actions.head
                       }
-                      else if(mActions.nonEmpty){
-                        choose = "medium"
+                      else if(i < 2*forty){
+                        mActions += actions.head
                       }
-                      else if(lActions.nonEmpty){
-                        choose = "large"
+                      else{
+                        lActions += actions.head
                       }
-                      else if(actions.nonEmpty){
-                        choose = "main"
-                      }
+                      actions.remove(0)
                     }
-                    if(turn == "main" && actions.nonEmpty){
-                      choose = "main"
-                    }
+                    sActions = sActions.sortBy(_.endTime)
+                    mActions = mActions.sortBy(_.endTime)
+                    lActions = lActions.sortBy(_.endTime)
+                  }
 
-                    choose match{
-                      case "main" =>
-                        if(actions.size < 10){
-                          actions = actions.sortBy(_.time)
-                          quantum = actions.size
-                          turn = "main"
-                          lock = actions.head
-                          self ! lock
-                        }
-                        else{
-                          val size = actions.size
-                          actions = actions.sortBy(_.time)
-                          val forty = (size * 0.4).toInt + 1
-
-                          for(i <- 0 until size){
-                            if(i < forty){
-                              sActions += actions.head
-                            }
-                            else if(i < 2*forty){
-                              mActions += actions.head
-                            }
-                            else{
-                              lActions += actions.head
-                            }
-                            actions.remove(0)
-                          }
-                          sActions = sActions.sortBy(_.time)
-                          mActions = mActions.sortBy(_.time)
-                          lActions = lActions.sortBy(_.time)
-
-                          maxQuantum = size / 5
-                          turn = "small"
-                          quantum = maxQuantum
-                          lock = sActions.head
-                          self ! lock
-                        }
-
+                  var choose = ""
+                  if(quantum > 0 && turn != "main"){
+                    choose = turn
+                  }
+                  else{
+                    maxQuantum = (sActions.size + mActions.size + lActions.size) / 5
+                    turn match{
                       case "small" =>
-                        turn = "small"
-                        quantum = maxQuantum
-                        lock = sActions.head
-                        self ! lock
+                        if(mActions.nonEmpty) {
+                          choose = "medium"
+                          quantum = maxQuantum
+                        }
+                        else if(lActions.nonEmpty){
+                          choose = "large"
+                          quantum = maxQuantum / 2
+                        }
+                        else if(sActions.nonEmpty){
+                          choose = "small"
+                          quantum = maxQuantum
+                        }
 
                       case "medium" =>
-                        turn = "medium"
-                        quantum = maxQuantum
-                        lock = mActions.head
-                        self ! lock
+                        if(lActions.nonEmpty) {
+                          choose = "large"
+                          quantum = maxQuantum / 2
+                        }
+                        else if(sActions.nonEmpty){
+                          choose = "small"
+                          quantum = maxQuantum
+                        }
+                        else if(mActions.nonEmpty){
+                          choose = "medium"
+                          quantum = maxQuantum
+                        }
 
                       case "large" =>
-                        turn = "large"
-                        quantum = maxQuantum / 2
-                        lock = lActions.head
-                        self ! lock
+                        if(sActions.nonEmpty) {
+                          choose = "small"
+                          quantum = maxQuantum
+                        }
+                        else if(mActions.nonEmpty){
+                          choose = "medium"
+                          quantum = maxQuantum
+                        }
+                        else if(lActions.nonEmpty){
+                          choose = "large"
+                          quantum = maxQuantum / 2
+                        }
 
-                      case _ =>
-                        val system = ActorSystem("dbsave")
-                        val dbsave = system.actorOf(Props[DbSave] , "dbsave")
-                        dbsave ! log(mylog)
-                        mylog = mylog.empty
-
-                        throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
-                        dbsave ! throughPut(throughPutLog)
-                        throughPutLog = throughPutLog.empty
-                        job = 0
+                      case "main" =>
+                        if(sActions.nonEmpty) {
+                          choose = "small"
+                          quantum = maxQuantum
+                        }
+                        else if(mActions.nonEmpty){
+                          choose = "medium"
+                          quantum = maxQuantum
+                        }
+                        else if(lActions.nonEmpty){
+                          choose = "large"
+                          quantum = maxQuantum / 2
+                        }
                     }
+                  }
+
+                  choose match{
+                    case "small" =>
+                      turn = "small"
+                      lock = sActions.head.r
+                      self ! lock
+
+                    case "medium" =>
+                      turn = "medium"
+                      lock = mActions.head.r
+                      self ! lock
+
+                    case "large" =>
+                      turn = "large"
+                      lock = lActions.head.r
+                      self ! lock
+
+                    case _ =>
+                      val system = ActorSystem("dbsave")
+                      val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                      dbsave ! log(mylog)
+                      mylog = mylog.empty
+
+                      throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
+                      dbsave ! throughPut(throughPutLog)
+                      throughPutLog = throughPutLog.empty
+                      job = 0
                   }
                 }
 
@@ -512,7 +638,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 }
                 if (!isLocked) {
                   // Add this request to the buffer, as it is not there yet.
-                  actions += r
+                  actions += act(r, System.currentTimeMillis() + r.time)
                   lock = r
                   turn = "main"
 
@@ -527,7 +653,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
           else {
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
-            actions += r
+            actions += act(r, System.currentTimeMillis() + r.time)
             mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size) , "start" -> System.currentTimeMillis))
           }
       }
