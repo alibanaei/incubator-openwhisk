@@ -77,10 +77,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
 
-  val state = "FCFS"
+//  val state = "FCFS"
 //  val state = "SJF"
 //  val state = "MQS"
-//  val state = "LUF"
+  val state = "LUF"
 
   case class act(r:Run, endTime:Long)
   var runActions = ListBuffer[act]()
@@ -758,24 +758,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 if (isResentFromBuffer) {
                   // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
                   // from the buffer
-                  val last = lastActions.head
                   lastActions.remove(0)
 
-                  if(lastUsed.exists(_._1 == last.instance)){
-                    lastUsed = lastUsed.updated(last.instance, System.currentTimeMillis())
-                  }else{
-                    lastUsed += (last.instance -> System.currentTimeMillis())
-                  }
-                  allActions.foreach{
-                    case act => if(act.instance == last.instance){
-                      allActions.update(allActions.indexOf(act) , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
-                    }
-                  }
-                  lastActions.foreach{
-                    case act => if(act.instance == last.instance){
-                      lastActions.update(lastActions.indexOf(act) , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
-                    }
-                  }
 
                   if(lastActions.isEmpty){
                     if(allActions.nonEmpty) {
@@ -788,7 +772,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   }
 
                   if(lastActions.nonEmpty){
-                    lastActions = lastActions.sortBy(_.lastUsed)
+                    lastActions = lastActions.sortBy(_.lastUsed).reverse
                     self ! lastActions.head.r
                   }
                   else {
@@ -801,6 +785,23 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! throughPut(throughPutLog)
                     throughPutLog = throughPutLog.empty
                     job = 0
+                  }
+                }
+
+                val instance = r.action.namespace.namespace + r.action.name.name + r.action.limits.memory.megabytes.toString
+                if(lastUsed.exists(_._1 == instance)){
+                  lastUsed = lastUsed.updated(instance, System.currentTimeMillis())
+                }else{
+                  lastUsed += (instance -> System.currentTimeMillis())
+                }
+                allActions.foreach{
+                  case act => if(act.instance == instance){
+                    allActions.update(allActions.indexOf(act) , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
+                  }
+                }
+                lastActions.foreach{
+                  case act => if(act.instance == instance){
+                    lastActions.update(lastActions.indexOf(act) , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
                   }
                 }
 
