@@ -99,6 +99,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var allActions = ListBuffer[anAction]()
   var lastActions = ListBuffer[anAction]()
   var lastUsed = immutable.Map.empty[String , Long]
+  val alpha = 10
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -760,11 +761,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   // from the buffer
                   lastActions.remove(0)
 
-
                   if(lastActions.isEmpty){
                     if(allActions.nonEmpty) {
                       allActions = allActions.sortBy(_.endTime)
-                      while (allActions.nonEmpty && lastActions.size < 5) {
+                      while (allActions.nonEmpty && lastActions.size < alpha) {
                         lastActions += allActions.head
                         allActions.remove(0)
                       }
@@ -795,14 +795,19 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   lastUsed += (instance -> System.currentTimeMillis())
                 }
                 allActions.foreach{
-                  case act => if(act.instance == instance){
-                    allActions.update(allActions.indexOf(act) , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
-                  }
+                  case act =>
+                    if(act.instance == instance){
+                      val index = allActions.indexOf(act)
+                      allActions.update(index , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
+                    }
                 }
+
                 lastActions.foreach{
-                  case act => if(act.instance == instance){
-                    lastActions.update(lastActions.indexOf(act) , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
-                  }
+                  case act =>
+                    if(act.instance == instance){
+                      val index = lastActions.indexOf(act)
+                      lastActions.update(index , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
+                    }
                 }
 
               case None =>
