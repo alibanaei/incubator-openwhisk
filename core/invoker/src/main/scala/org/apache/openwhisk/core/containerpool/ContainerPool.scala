@@ -77,10 +77,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
 
-//  val state = "FCFS"
+  val state = "FCFS"
 //  val state = "SJF"
 //  val state = "MQS"
-  val state = "LUF"
 
   case class act(r:Run, endTime:Long)
   var runActions = ListBuffer[act]()
@@ -95,11 +94,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var mActions = ListBuffer[Run]()
   var lActions = ListBuffer[Run]()
 
-  case class anAction(r:Run, endTime:Long, instance:String, lastUsed:Long)
-  var allActions = ListBuffer[anAction]()
-  var lastActions = ListBuffer[anAction]()
-  var lastUsed = immutable.Map.empty[String , Long]
-  val alpha = 10
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -675,191 +669,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // These waiting actions were not able to free up enough memory.
             actions += r
             mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size) , "start" -> System.currentTimeMillis))
-          }
-
-        case "LUF" =>
-          // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
-          val isResentFromBuffer = lastActions.nonEmpty && lastActions.head.r.msg == r.msg
-
-          // Only process request, if there are no other requests waiting for free slots, or if the current request is the
-          // next request to process
-          // It is guaranteed, that only the first message on the buffer is resent.
-          if (lastActions.isEmpty || isResentFromBuffer) {
-            val createdContainer =
-            // Is there enough space on the invoker for this action to be executed.
-              if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
-
-                if(mylog.exists(_._1 == r.msg.activationId.toString)){
-                  val key = r.msg.activationId.toString
-                  var temp = mylog(key)
-                  temp += ("end" -> System.currentTimeMillis)
-                  mylog = mylog.updated(key , temp)
-                }
-                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
-                  job += 1
-                }
-
-                // Schedule a job to a warm container
-                ContainerPool
-                  .schedule(r.action, r.msg.user.namespace.name, freePool)
-                  .map(container => (container, container._2.initingState)) //warmed, warming, and warmingCold always know their state
-                  .orElse(
-                  // There was no warm/warming/warmingCold container. Try to take a prewarm container or a cold container.
-
-                  // Is there enough space to create a new container or do other containers have to be removed?
-                  if (hasPoolSpaceFor(busyPool ++ freePool, r.action.limits.memory.megabytes.MB)) {
-                    takePrewarmContainer(r.action)
-                      .map(container => (container, "prewarmed"))
-                      .orElse(Some(createContainer(r.action.limits.memory.megabytes.MB), "cold"))
-                  } else None)
-                  .orElse(
-                    // Remove a container and create a new one for the given job
-                    ContainerPool
-                      // Only free up the amount, that is really needed to free up
-                      .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB)
-                      .map(removeContainer)
-                      // If the list had at least one entry, enough containers were removed to start the new container. After
-                      // removing the containers, we are not interested anymore in the containers that have been removed.
-                      .headOption
-                      .map(_ =>
-                        takePrewarmContainer(r.action)
-                          .map(container => (container, "recreatedPrewarm"))
-                          .getOrElse(createContainer(r.action.limits.memory.megabytes.MB), "recreated")))
-
-              } else None
-
-            createdContainer match {
-              case Some(((actor, data), containerState)) =>
-                //increment active count before storing in pool map
-                val newData = data.nextRun(r)
-                val container = newData.getContainer
-
-                if (newData.activeActivationCount < 1) {
-                  logging.error(this, s"invalid activation count < 1 ${newData}")
-                }
-
-                //only move to busyPool if max reached
-                if (!newData.hasCapacity()) {
-                  if (r.action.limits.concurrency.maxConcurrent > 1) {
-                    logging.info(
-                      this,
-                      s"container ${container} is now busy with ${newData.activeActivationCount} activations")
-                  }
-                  busyPool = busyPool + (actor -> newData)
-                  freePool = freePool - actor
-                } else {
-                  //update freePool to track counts
-                  freePool = freePool + (actor -> newData)
-                }
-
-                actor ! r // forwards the run request to the container
-                logContainerStart(r, containerState, newData.activeActivationCount, container)
-
-                // Remove the action that get's executed now from the buffer and execute the next one afterwards.
-                if (isResentFromBuffer) {
-                  // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
-                  // from the buffer
-                  lastActions.remove(0)
-
-                  if(lastActions.isEmpty){
-                    if(allActions.nonEmpty) {
-                      allActions = allActions.sortBy(_.endTime)
-                      while (allActions.nonEmpty && lastActions.size < alpha) {
-                        lastActions += allActions.head
-                        allActions.remove(0)
-                      }
-                    }
-                  }
-
-                  if(lastActions.nonEmpty){
-                    lastActions = lastActions.sortBy(_.lastUsed).reverse
-                    self ! lastActions.head.r
-                  }
-                  else {
-                    val system = ActorSystem("dbsave")
-                    val dbsave = system.actorOf(Props[DbSave] , "dbsave")
-                    dbsave ! log(mylog)
-                    mylog = mylog.empty
-
-                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
-                    dbsave ! throughPut(throughPutLog)
-                    throughPutLog = throughPutLog.empty
-                    job = 0
-                  }
-                }
-
-                val instance = r.action.namespace.namespace + r.action.name.name + r.action.limits.memory.megabytes.toString
-                if(lastUsed.exists(_._1 == instance)){
-                  lastUsed = lastUsed.updated(instance, System.currentTimeMillis())
-                }else{
-                  lastUsed += (instance -> System.currentTimeMillis())
-                }
-                allActions.foreach{
-                  case act =>
-                    if(act.instance == instance){
-                      val index = allActions.indexOf(act)
-                      allActions.update(index , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
-                    }
-                }
-
-                lastActions.foreach{
-                  case act =>
-                    if(act.instance == instance){
-                      val index = lastActions.indexOf(act)
-                      lastActions.update(index , anAction(act.r, act.endTime, act.instance, System.currentTimeMillis()))
-                    }
-                }
-
-              case None =>
-                // this can also happen if createContainer fails to start a new container, or
-                // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
-                // (and a new container would over commit the pool)
-                val isErrorLogged = r.retryLogDeadline.map(_.isOverdue).getOrElse(true)
-                val retryLogDeadline = if (isErrorLogged) {
-                  logging.error(
-                    this,
-                    s"Rescheduling Run message, too many message in the pool, " +
-                      s"freePoolSize: ${freePool.size} containers and ${memoryConsumptionOf(freePool)} MB, " +
-                      s"busyPoolSize: ${busyPool.size} containers and ${memoryConsumptionOf(busyPool)} MB, " +
-                      s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
-                      s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
-                      s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
-                      s"waiting messages: ${runActions.size}")(r.msg.transid)
-                  Some(logMessageInterval.fromNow)
-                } else {
-                  r.retryLogDeadline
-                }
-
-                if (!isResentFromBuffer) {
-                  // Add this request to the buffer, as it is not there yet.
-
-                  val instance = r.action.namespace.namespace + r.action.name.name + r.action.limits.memory.megabytes.toString
-                  val lastUsedTime = if(lastUsed.exists(_._1 == instance)){
-                    lastUsed(instance)
-                  }else{
-                    0
-                  }
-                  lastActions += anAction(r, System.currentTimeMillis() + r.time, instance, lastUsedTime)
-                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> lastActions.size , "start" -> System.currentTimeMillis))
-                  throughPutLog += ("startTime" -> System.currentTimeMillis)
-                }
-
-                // As this request is the first one in the buffer, try again to execute it.
-                self ! Run(r.action, r.msg, retryLogDeadline , r.time)
-            }
-          } else {
-            // There are currently actions waiting to be executed before this action gets executed.
-            // These waiting actions were not able to free up enough memory.
-
-            val instance = r.action.namespace.namespace + r.action.name.name + r.action.limits.memory.megabytes.toString
-            val lastUsedTime = if(lastUsed.exists(_._1 == instance)){
-              lastUsed(instance)
-            }else{
-              0
-            }
-
-            allActions += anAction(r, System.currentTimeMillis() + r.time, instance, lastUsedTime)
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (allActions.size + lastActions.size) , "start" -> System.currentTimeMillis))
           }
       }
 
