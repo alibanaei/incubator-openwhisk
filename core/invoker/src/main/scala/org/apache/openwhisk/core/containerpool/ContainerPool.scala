@@ -77,9 +77,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
 
-  val state = "FCFS"
-//  val state = "SJF"
+//  val state = "FCFS"
+  val state = "SJF"
 //  val state = "MQS"
+//  val state = "cache"
 
   case class act(r:Run, endTime:Long)
   var runActions = ListBuffer[act]()
@@ -94,6 +95,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var mActions = ListBuffer[Run]()
   var lActions = ListBuffer[Run]()
 
+  var lock_index = 0
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -669,6 +671,170 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // These waiting actions were not able to free up enough memory.
             actions += r
             mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size) , "start" -> System.currentTimeMillis))
+          }
+
+        case "cache" =>
+          // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
+          var is_lock = runActions.nonEmpty && lock.msg == r.msg
+
+          var change_lock = false
+          if(freePool.nonEmpty && is_lock) {
+            val lock_has_warm = ContainerPool.schedule(r.action, r.msg.user.namespace.name, freePool).getOrElse(false)
+            if(lock_has_warm == false) {
+              runActions.foreach {
+                case act =>
+                  if(!change_lock) {
+                    val warm = ContainerPool.schedule(act.r.action, act.r.msg.user.namespace.name, freePool).getOrElse(false)
+                    if (warm != false) {
+                      if (act.r.msg != lock.msg && (act.r.time < 3000 || runActions.indexOf(act) < busyPool.size)) {
+                        change_lock = true
+                        is_lock = false
+                        lock = act.r
+                        lock_index = runActions.indexOf(act)
+                        self ! act.r
+                      }
+                    }
+                  }
+              }
+            }
+          }
+
+
+          // Only process request, if there are no other requests waiting for free slots, or if the current request is the
+          // next request to process
+          // It is guaranteed, that only the first message on the buffer is resent.
+          if (runActions.isEmpty || is_lock) {
+            val createdContainer =
+            // Is there enough space on the invoker for this action to be executed.
+              if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
+
+                if(mylog.exists(_._1 == r.msg.activationId.toString)){
+                  val key = r.msg.activationId.toString
+                  var temp = mylog(key)
+                  temp += ("end" -> System.currentTimeMillis)
+                  mylog = mylog.updated(key , temp)
+                }
+                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
+                  job += 1
+                }
+
+                // Schedule a job to a warm container
+                ContainerPool
+                  .schedule(r.action, r.msg.user.namespace.name, freePool)
+                  .map(container => (container, container._2.initingState)) //warmed, warming, and warmingCold always know their state
+                  .orElse(
+                  // There was no warm/warming/warmingCold container. Try to take a prewarm container or a cold container.
+
+                  // Is there enough space to create a new container or do other containers have to be removed?
+                  if (hasPoolSpaceFor(busyPool ++ freePool, r.action.limits.memory.megabytes.MB)) {
+                    takePrewarmContainer(r.action)
+                      .map(container => (container, "prewarmed"))
+                      .orElse(Some(createContainer(r.action.limits.memory.megabytes.MB), "cold"))
+                  } else None)
+                  .orElse(
+                    // Remove a container and create a new one for the given job
+                    ContainerPool
+                      // Only free up the amount, that is really needed to free up
+                      .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB)
+                      .map(removeContainer)
+                      // If the list had at least one entry, enough containers were removed to start the new container. After
+                      // removing the containers, we are not interested anymore in the containers that have been removed.
+                      .headOption
+                      .map(_ =>
+                        takePrewarmContainer(r.action)
+                          .map(container => (container, "recreatedPrewarm"))
+                          .getOrElse(createContainer(r.action.limits.memory.megabytes.MB), "recreated")))
+
+              } else None
+
+            createdContainer match {
+              case Some(((actor, data), containerState)) =>
+                //increment active count before storing in pool map
+                val newData = data.nextRun(r)
+                val container = newData.getContainer
+
+                if (newData.activeActivationCount < 1) {
+                  logging.error(this, s"invalid activation count < 1 ${newData}")
+                }
+
+                //only move to busyPool if max reached
+                if (!newData.hasCapacity()) {
+                  if (r.action.limits.concurrency.maxConcurrent > 1) {
+                    logging.info(
+                      this,
+                      s"container ${container} is now busy with ${newData.activeActivationCount} activations")
+                  }
+                  busyPool = busyPool + (actor -> newData)
+                  freePool = freePool - actor
+                } else {
+                  //update freePool to track counts
+                  freePool = freePool + (actor -> newData)
+                }
+
+                actor ! r // forwards the run request to the container
+                logContainerStart(r, containerState, newData.activeActivationCount, container)
+
+                // Remove the action that get's executed now from the buffer and execute the next one afterwards.
+                if (is_lock) {
+                  // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
+                  // from the buffer
+                  runActions.remove(lock_index)
+
+                  if(runActions.nonEmpty){
+                    runActions = runActions.sortBy(_.endTime)
+                    lock = runActions.head.r
+                    lock_index = 0
+                    self ! lock
+                  }
+                  else{
+                    val system = ActorSystem("dbsave")
+                    val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                    dbsave ! log(mylog)
+                    mylog = mylog.empty
+
+                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
+                    dbsave ! throughPut(throughPutLog)
+                    throughPutLog = throughPutLog.empty
+                    job = 0
+
+                    lock_index = 0
+                  }
+                }
+
+              case None =>
+                // this can also happen if createContainer fails to start a new container, or
+                // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
+                // (and a new container would over commit the pool)
+                val isErrorLogged = r.retryLogDeadline.map(_.isOverdue).getOrElse(true)
+                val retryLogDeadline = if (isErrorLogged) {
+                  logging.error(
+                    this,
+                    s"Rescheduling Run message, too many message in the pool, " +
+                      s"freePoolSize: ${freePool.size} containers and ${memoryConsumptionOf(freePool)} MB, " +
+                      s"busyPoolSize: ${busyPool.size} containers and ${memoryConsumptionOf(busyPool)} MB, " +
+                      s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
+                      s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
+                      s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
+                      s"waiting messages: ${runActions.size}")(r.msg.transid)
+                  Some(logMessageInterval.fromNow)
+                } else {
+                  r.retryLogDeadline
+                }
+                if (!is_lock) {
+                  // Add this request to the buffer, as it is not there yet.
+                  runActions += act(r, System.currentTimeMillis() + r.time)
+                  lock = r
+                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
+                  throughPutLog += ("startTime" -> System.currentTimeMillis)
+                }
+                // As this request is the first one in the buffer, try again to execute it.
+                self ! Run(r.action, r.msg, retryLogDeadline , r.time)
+            }
+          } else if(!change_lock){
+            // There are currently actions waiting to be executed before this action gets executed.
+            // These waiting actions were not able to free up enough memory.
+            runActions += act(r, System.currentTimeMillis() + r.time)
+            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
           }
       }
 
