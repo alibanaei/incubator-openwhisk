@@ -77,8 +77,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
 
-//  val state = "FCFS"
-  val state = "SJF"
+  val state = "FCFS"
+//  val state = "NEJF"
 //  val state = "MQS"
 //  val state = "cache"
 
@@ -258,7 +258,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
           }
 
-        case "SJF" =>
+        case "NEJF" =>
           // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
           val isResentFromBuffer = runActions.nonEmpty && runActions.head.r.msg == r.msg
 
