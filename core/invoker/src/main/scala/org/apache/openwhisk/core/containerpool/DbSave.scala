@@ -9,6 +9,7 @@ import scala.collection.immutable
 
 case class log(data: immutable.Map[String , immutable.Map[String , Any]])
 case class throughPut(throughPut: immutable.Map[String , Any])
+case class containerStateCount(cs: immutable.Map[String, Int])
 
 class DbSave extends Actor{
   implicit val logging = new AkkaLogging(context.system.log)
@@ -45,7 +46,25 @@ class DbSave extends Actor{
           (r.nextInt(100)*r.nextInt(100)) +
           (r.nextInt(10)*r.nextInt(10))
         ).toString
+
       db("throughput").putDoc(id, JsObject(result))
       logging.info(this, s"aliu throughput = ${result}")
+
+    case containerStateCount(data) =>
+      val r = scala.util.Random
+      val id = (
+        (r.nextInt(10000)*r.nextInt(10000)) +
+          (r.nextInt(1000)*r.nextInt(1000)) +
+          (r.nextInt(100)*r.nextInt(100)) +
+          (r.nextInt(10)*r.nextInt(10))
+        ).toString
+
+      var result = immutable.Map[String, JsString]()
+      data.foreach{
+        case r =>
+          result += (r._1 -> JsString(r._2.toString))
+      }
+      db("container_state").putDoc(id, JsObject(result))
+      logging.info(this, s"aliu db = ${result}")
   }
 }

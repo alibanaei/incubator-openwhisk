@@ -76,9 +76,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var mylog = immutable.Map.empty[String , immutable.Map[String , Any]]
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
+  var containers_state = immutable.Map.empty[String , Int]
 
-//  val state = "FCFS"
-  val state = "NEJF"
+  val state = "FCFS"
+//  val state = "NEJF"
 //  val state = "MQS"
 //  val state = "cache"
 //  val state = "SJF"
@@ -180,6 +181,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
+                if(r.action.namespace.namespace != "whisk.system") {
+                  if (containers_state.exists(_._1 == containerState)) {
+                    val key = containerState
+                    var temp = containers_state(key)
+                    temp += 1
+                    containers_state = containers_state.updated(key, temp)
+                  } else {
+                    containers_state += (containerState -> 1)
+                  }
+                }
+
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
                 val container = newData.getContainer
@@ -219,9 +231,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! throughPut(throughPutLog)
                     throughPutLog = throughPutLog.empty
                     job = 0
-                  }
 
+
+                    dbsave ! containerStateCount(containers_state)
+                    containers_state = containers_state.empty
+                  }
                 }
+
                 actor ! r // forwards the run request to the container
                 logContainerStart(r, containerState, newData.activeActivationCount, container)
               case None =>
@@ -312,6 +328,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
+                if(r.action.namespace.namespace != "whisk.system") {
+                  if (containers_state.exists(_._1 == containerState)) {
+                    val key = containerState
+                    var temp = containers_state(key)
+                    temp += 1
+                    containers_state = containers_state.updated(key, temp)
+                  } else {
+                    containers_state += (containerState -> 1)
+                  }
+                }
+
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
                 val container = newData.getContainer
@@ -356,6 +383,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! throughPut(throughPutLog)
                     throughPutLog = throughPutLog.empty
                     job = 0
+
+                    dbsave ! containerStateCount(containers_state)
+                    containers_state = containers_state.empty
                   }
                 }
 
@@ -687,7 +717,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   if(!change_lock) {
                     val warm = ContainerPool.schedule(act.r.action, act.r.msg.user.namespace.name, freePool).getOrElse(false)
                     if (warm != false) {
-                      if (act.r.msg != lock.msg && (act.r.time < 3000 || runActions.indexOf(act) < busyPool.size)) {
+                      if (act.r.msg != lock.msg /*&& (act.r.time < 3000 || runActions.indexOf(act) < busyPool.size)*/) {
                         change_lock = true
                         is_lock = false
                         lock = act.r
@@ -750,6 +780,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
+                if(r.action.namespace.namespace != "whisk.system") {
+                  if (containers_state.exists(_._1 == containerState)) {
+                    val key = containerState
+                    var temp = containers_state(key)
+                    temp += 1
+                    containers_state = containers_state.updated(key, temp)
+                  } else {
+                    containers_state += (containerState -> 1)
+                  }
+                }
+
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
                 val container = newData.getContainer
@@ -797,6 +838,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! throughPut(throughPutLog)
                     throughPutLog = throughPutLog.empty
                     job = 0
+
+                    dbsave ! containerStateCount(containers_state)
+                    containers_state = containers_state.empty
 
                     lock_index = 0
                   }
