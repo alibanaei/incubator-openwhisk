@@ -77,6 +77,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var throughPutLog = immutable.Map.empty[String , Any]
   var job = 0
   var containers_state = immutable.Map.empty[String , Int]
+  var time_n:Long = 0
+
+  var resource = ListBuffer[r_free]()
 
   val state = "FCFS"
 //  val state = "NEJF"
@@ -85,7 +88,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 //  val state = "SJF"
 
   case class act(r:Run, endTime:Long)
+  case class act2(r:Run, arriveTime:Long, execTime:Int, endTime:Long)
   var runActions = ListBuffer[act]()
+  var runActions2 = ListBuffer[act2]()
 
   var lock : Run = _
   var turn = ""
@@ -232,6 +237,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     throughPutLog = throughPutLog.empty
                     job = 0
 
+                    val new_resource = resource.clone()
+                    dbsave ! resourceData(new_resource)
+                    resource.clear()
 
                     dbsave ! containerStateCount(containers_state)
                     containers_state = containers_state.empty
@@ -264,7 +272,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   runBuffer = runBuffer.enqueue(r)
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
                   throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  time_n = System.currentTimeMillis()
                 }
+
+                if(System.currentTimeMillis() - time_n > 1000){
+                  val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
+                  resource += r_free(time_n, System.currentTimeMillis(), free)
+                  time_n = System.currentTimeMillis()
+                }
+
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)
             }
@@ -386,6 +403,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
                     dbsave ! containerStateCount(containers_state)
                     containers_state = containers_state.empty
+
+                    val new_resource = resource.clone()
+                    dbsave ! resourceData(new_resource)
+                    resource.clear()
+
                   }
                 }
 
@@ -413,7 +435,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   runActions += act(r, System.currentTimeMillis() + r.time)
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
                   throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  time_n = System.currentTimeMillis()
                 }
+
+                if(System.currentTimeMillis() - time_n > 1000){
+                  val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
+                  resource += r_free(time_n, System.currentTimeMillis(), free)
+                  time_n = System.currentTimeMillis()
+                }
+
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)
             }
@@ -706,10 +737,39 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
         case "cache" =>
           // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
-          var is_lock = runActions.nonEmpty && lock.msg == r.msg
+          var is_lock = runActions2.nonEmpty && lock.msg == r.msg
 
           var change_lock = false
-          if(freePool.nonEmpty && is_lock) {
+          if(is_lock && lock_index == 0 && !hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
+            if(freePool.nonEmpty){
+              runActions2.foreach {
+                case act2 =>
+                  if(!change_lock) {
+                    val warm = ContainerPool.schedule(act2.r.action, act2.r.msg.user.namespace.name, freePool).getOrElse(false)
+                    if (warm != false && act2.arriveTime < runActions2(lock_index).arriveTime) {
+                      change_lock = true
+                      is_lock = false
+                      lock = act2.r
+                      lock_index = runActions2.indexOf(act2)
+                      self ! act2.r
+                    }
+                  }
+              }
+            }
+            if(!change_lock && memoryConsumptionOf(busyPool ++ freePool) < poolConfig.userMemory.toMB){
+              runActions2.foreach {
+                case act2 =>
+                  if(!change_lock && act2.arriveTime < runActions2(lock_index).arriveTime && hasPoolSpaceFor(busyPool ++ freePool, act2.r.action.limits.memory.megabytes.MB)) {
+                    change_lock = true
+                    is_lock = false
+                    lock = act2.r
+                    lock_index = runActions2.indexOf(act2)
+                    self ! act2.r
+                  }
+              }
+            }
+
+            /*
             val lock_has_warm = ContainerPool.schedule(r.action, r.msg.user.namespace.name, freePool).getOrElse(false)
             if(lock_has_warm == false) {
               runActions.foreach {
@@ -727,14 +787,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     }
                   }
               }
-            }
+            }*/
           }
 
 
           // Only process request, if there are no other requests waiting for free slots, or if the current request is the
           // next request to process
           // It is guaranteed, that only the first message on the buffer is resent.
-          if (runActions.isEmpty || is_lock) {
+          if (runActions2.isEmpty || is_lock) {
             val createdContainer =
             // Is there enough space on the invoker for this action to be executed.
               if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
@@ -820,11 +880,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 if (is_lock) {
                   // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
                   // from the buffer
-                  runActions.remove(lock_index)
+                  runActions2.remove(lock_index)
 
-                  if(runActions.nonEmpty){
-                    runActions = runActions.sortBy(_.endTime)
-                    lock = runActions.head.r
+                  if(runActions2.nonEmpty){
+                    runActions2 = runActions2.sortBy(_.endTime)
+                    lock = runActions2.head.r
                     lock_index = 0
                     self ! lock
                   }
@@ -841,6 +901,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
                     dbsave ! containerStateCount(containers_state)
                     containers_state = containers_state.empty
+
+                    var new_resource = resource.clone()
+                    dbsave ! resourceData(new_resource)
+                    resource.clear()
 
                     lock_index = 0
                   }
@@ -860,26 +924,33 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                       s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
                       s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
                       s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
-                      s"waiting messages: ${runActions.size}")(r.msg.transid)
+                      s"waiting messages: ${runActions2.size}")(r.msg.transid)
                   Some(logMessageInterval.fromNow)
                 } else {
                   r.retryLogDeadline
                 }
                 if (!is_lock) {
                   // Add this request to the buffer, as it is not there yet.
-                  runActions += act(r, System.currentTimeMillis() + r.time)
+                  runActions2 += act2(r, System.currentTimeMillis(), r.time, System.currentTimeMillis() + r.time)
                   lock = r
-                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
+                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions2.size , "start" -> System.currentTimeMillis()))
                   throughPutLog += ("startTime" -> System.currentTimeMillis)
+                  time_n = System.currentTimeMillis()
                 }
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)
+
+                if(System.currentTimeMillis() - time_n > 1000){
+                  val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
+                  resource += r_free(time_n, System.currentTimeMillis(), free)
+                  time_n = System.currentTimeMillis()
+                }
             }
           } else if(!change_lock){
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
-            runActions += act(r, System.currentTimeMillis() + r.time)
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
+            runActions2 += act2(r, System.currentTimeMillis(), r.time, System.currentTimeMillis() + r.time)
+            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions2.size , "start" -> System.currentTimeMillis()))
           }
 
         case "SJF" =>
