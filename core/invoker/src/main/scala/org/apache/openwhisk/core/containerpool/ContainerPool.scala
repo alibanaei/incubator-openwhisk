@@ -103,6 +103,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var lActions = ListBuffer[Run]()
 
   var lock_index = 0
+  val period_time = 3000
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -276,7 +277,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   time_n = System.currentTimeMillis()
                 }
 
-                if(System.currentTimeMillis() - time_n > 1000){
+                if((System.currentTimeMillis() - time_n).toInt >= period_time){
                   val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
                   resource += r_free(time_n, System.currentTimeMillis(), free)
                   time_n = System.currentTimeMillis()
@@ -439,7 +440,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   time_n = System.currentTimeMillis()
                 }
 
-                if(System.currentTimeMillis() - time_n > 1000){
+                if(System.currentTimeMillis() - time_n >= period_time){
                   val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
                   resource += r_free(time_n, System.currentTimeMillis(), free)
                   time_n = System.currentTimeMillis()
@@ -746,7 +747,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 case act2 =>
                   if(!change_lock) {
                     val warm = ContainerPool.schedule(act2.r.action, act2.r.msg.user.namespace.name, freePool).getOrElse(false)
-                    if (warm != false && act2.arriveTime < runActions2(lock_index).arriveTime) {
+                    if (warm != false && (act2.arriveTime - 1000) <= runActions2(lock_index).arriveTime) {
                       change_lock = true
                       is_lock = false
                       lock = act2.r
@@ -759,7 +760,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             if(!change_lock && memoryConsumptionOf(busyPool ++ freePool) < poolConfig.userMemory.toMB){
               runActions2.foreach {
                 case act2 =>
-                  if(!change_lock && act2.arriveTime < runActions2(lock_index).arriveTime && hasPoolSpaceFor(busyPool ++ freePool, act2.r.action.limits.memory.megabytes.MB)) {
+                  if(!change_lock && (act2.arriveTime - 1000) <= runActions2(lock_index).arriveTime && hasPoolSpaceFor(busyPool ++ freePool, act2.r.action.limits.memory.megabytes.MB)) {
                     change_lock = true
                     is_lock = false
                     lock = act2.r
@@ -940,7 +941,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)
 
-                if(System.currentTimeMillis() - time_n > 1000){
+                if(System.currentTimeMillis() - time_n >= period_time){
                   val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
                   resource += r_free(time_n, System.currentTimeMillis(), free)
                   time_n = System.currentTimeMillis()
