@@ -103,7 +103,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   var lActions = ListBuffer[Run]()
 
   var lock_index = 0
-  val period_time = 3000
+  val period_time = 1000
 
   prewarmConfig.foreach { config =>
     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
@@ -408,7 +408,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     val new_resource = resource.clone()
                     dbsave ! resourceData(new_resource)
                     resource.clear()
-
                   }
                 }
 
@@ -511,6 +510,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
+                if(r.action.namespace.namespace != "whisk.system") {
+                  if (containers_state.exists(_._1 == containerState)) {
+                    val key = containerState
+                    var temp = containers_state(key)
+                    temp += 1
+                    containers_state = containers_state.updated(key, temp)
+                  } else {
+                    containers_state += (containerState -> 1)
+                  }
+                }
+
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
                 val container = newData.getContainer
@@ -692,6 +702,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                         dbsave ! throughPut(throughPutLog)
                         throughPutLog = throughPutLog.empty
                         job = 0
+
+                        dbsave ! containerStateCount(containers_state)
+                        containers_state = containers_state.empty
+
+                        var new_resource = resource.clone()
+                        dbsave ! resourceData(new_resource)
+                        resource.clear()
                     }
                   }
                 }
@@ -723,6 +740,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size) , "start" -> System.currentTimeMillis))
                   throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  time_n = System.currentTimeMillis()
+                }
+
+                if(System.currentTimeMillis() - time_n >= period_time){
+                  val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
+                  resource += r_free(time_n, System.currentTimeMillis(), free)
+                  time_n = System.currentTimeMillis()
                 }
 
                 // As this request is the first one in the buffer, try again to execute it.
@@ -890,6 +915,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     self ! lock
                   }
                   else{
+                    logging.info(this, s"alii memory = ${poolConfig.userMemory.toMB}")
+
                     val system = ActorSystem("dbsave")
                     val dbsave = system.actorOf(Props[DbSave] , "dbsave")
                     dbsave ! log(mylog)
@@ -1007,6 +1034,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
+                if(r.action.namespace.namespace != "whisk.system") {
+                  if (containers_state.exists(_._1 == containerState)) {
+                    val key = containerState
+                    var temp = containers_state(key)
+                    temp += 1
+                    containers_state = containers_state.updated(key, temp)
+                  } else {
+                    containers_state += (containerState -> 1)
+                  }
+                }
+
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
                 val container = newData.getContainer
@@ -1051,6 +1089,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! throughPut(throughPutLog)
                     throughPutLog = throughPutLog.empty
                     job = 0
+
+                    dbsave ! containerStateCount(containers_state)
+                    containers_state = containers_state.empty
+
+                    val new_resource = resource.clone()
+                    dbsave ! resourceData(new_resource)
+                    resource.clear()
                   }
                 }
 
@@ -1078,7 +1123,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   actions += r
                   mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> actions.size , "start" -> System.currentTimeMillis))
                   throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  time_n = System.currentTimeMillis()
                 }
+
+                if(System.currentTimeMillis() - time_n >= period_time){
+                  val free = (poolConfig.userMemory.toMB - memoryConsumptionOf(busyPool)).toInt
+                  resource += r_free(time_n, System.currentTimeMillis(), free)
+                  time_n = System.currentTimeMillis()
+                }
+
                 // As this request is the first one in the buffer, try again to execute it.
                 self ! Run(r.action, r.msg, retryLogDeadline , r.time)
             }
