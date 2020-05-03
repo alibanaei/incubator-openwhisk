@@ -19,7 +19,7 @@ class DbSave extends Actor{
   implicit val logging = new AkkaLogging(context.system.log)
   implicit val ec =  scala.concurrent.ExecutionContext.global
   val db = (dbName: String) => {
-    new CouchDbRestClient("http", "172.17.245.7", 5984, "scc", "IUST9572", dbName)(context.system , logging)
+    new CouchDbRestClient("http", "172.17.245.8", 5984, "scc", "IUST9572", dbName)(context.system , logging)
   }
 
   def receive: Receive = {

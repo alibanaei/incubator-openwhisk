@@ -23,7 +23,7 @@ class ResultProcess(namespace: EntityPath,
   val db = {
     implicit val sys = ActorSystem()
     implicit val log = logging.asInstanceOf[org.apache.openwhisk.common.Logging]
-    new CouchDbRestClient("http", "172.17.245.7", 5984, "scc", "IUST9572", "action_time")(sys , log)
+    new CouchDbRestClient("http", "172.17.245.8", 5984, "scc", "IUST9572", "action_time")(sys , log)
   }
 
   val generateID:String = {
