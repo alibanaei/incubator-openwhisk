@@ -249,12 +249,12 @@ class InvokerReactive(
                   )
                   val resultProcess = new ResultProcess(executable.namespace , executable.name , msg.activationId , JsObject(limits) , msg.content getOrElse JsObject.empty , None , logging)
                   val rTime = resultProcess.getTime
-                 /*
-                  val rTime = if(msg.content.nonEmpty) {
-                    (msg.content.get.fields("number").toString.toInt)*1000
-                  }else{
-                    0
-                  }*/
+
+//                  val rTime = if(msg.content.nonEmpty) {
+//                    (msg.content.get.fields("number").toString.toInt)*1000
+//                  }else{
+//                    0
+//                  }
                   pool ! Run(executable, msg , time = rTime)
 
                   Future.successful(())
