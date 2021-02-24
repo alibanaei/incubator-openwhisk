@@ -48,7 +48,7 @@ class ResultProcess(namespace: EntityPath,
           val time = stringToInt(oldData.asJsObject.fields("time").toString)
           val count = stringToInt(oldData.asJsObject.fields("count").toString)
           val due = duration.getOrElse(0).toString.toLong
-          val newTime = ((time * count).toLong + due) / (count + 1)
+          val newTime = ((0.5 * due) + (0.5 * time.toLong)).toInt
           val result = Map(
             "time" -> JsString(newTime.toString),
             "user" -> oldData.asJsObject.fields("user"),
@@ -83,7 +83,6 @@ class ResultProcess(namespace: EntityPath,
         db.putDoc(generateID , JsObject(res))
 
       case _ =>
-
         val parameters = Map(
           "time" -> JsString(duration.getOrElse(0).toString),
           "user" -> JsString(namespace.toString),

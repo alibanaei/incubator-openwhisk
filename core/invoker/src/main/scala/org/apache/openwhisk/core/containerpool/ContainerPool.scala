@@ -142,20 +142,22 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
           // next request to process
           // It is guaranteed, that only the first message on the buffer is resent.
           if (runBuffer.isEmpty || isResentFromBuffer) {
+
+            if(!mylog.exists(_._1 == r.msg.activationId.toString)){
+              mylog += (r.msg.activationId.toString -> Map(
+                "action" -> r.action.name.name,
+                "namespace" -> r.msg.user.namespace.name,
+                "memory" -> r.action.limits.memory.megabytes.toInt,
+                "queueSize" -> runBuffer.size,
+                "start" -> System.currentTimeMillis,
+                "executionTime" -> r.time,
+                )
+              )
+            }
+
             val createdContainer =
             // Is there enough space on the invoker for this action to be executed.
               if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
-
-                if(mylog.exists(_._1 == r.msg.activationId.toString)){
-                  val key = r.msg.activationId.toString
-                  var temp = mylog(key)
-                  temp += ("end" -> System.currentTimeMillis)
-                  mylog = mylog.updated(key , temp)
-                }
-                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
-                  job += 1
-                }
-
                 // Schedule a job to a warm container
                 ContainerPool
                   .schedule(r.action, r.msg.user.namespace.name, freePool)
@@ -187,16 +189,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
-                if(r.action.namespace.namespace != "whisk.system") {
-                  if (containers_state.exists(_._1 == containerState)) {
-                    val key = containerState
-                    var temp = containers_state(key)
-                    temp += 1
-                    containers_state = containers_state.updated(key, temp)
-                  } else {
-                    containers_state += (containerState -> 1)
-                  }
-                }
+
+                val key = r.msg.activationId.toString
+                var temp = mylog(key)
+                temp += ("containerState" -> containerState)
+                mylog = mylog.updated(key , temp)
+
 
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
@@ -220,6 +218,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   freePool = freePool + (actor -> newData)
                 }
                 // Remove the action that get's executed now from the buffer and execute the next one afterwards.
+
+
+
+                temp = mylog(key)
+                temp += ("end" -> System.currentTimeMillis)
+                mylog = mylog.updated(key , temp)
+
+
                 if (isResentFromBuffer) {
                   // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
                   // from the buffer
@@ -233,22 +239,21 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! log(mylog)
                     mylog = mylog.empty
 
-                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
-                    dbsave ! throughPut(throughPutLog)
-                    throughPutLog = throughPutLog.empty
-                    job = 0
-
                     val new_resource = resource.clone()
                     dbsave ! resourceData(new_resource)
                     resource.clear()
-
-                    dbsave ! containerStateCount(containers_state)
-                    containers_state = containers_state.empty
                   }
+                }
+                else if(mylog.nonEmpty){
+                  val system = ActorSystem("dbsave")
+                  val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                  dbsave ! log(mylog)
+                  mylog = mylog.empty
                 }
 
                 actor ! r // forwards the run request to the container
                 logContainerStart(r, containerState, newData.activeActivationCount, container)
+
               case None =>
                 // this can also happen if createContainer fails to start a new container, or
                 // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
@@ -271,8 +276,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 if (!isResentFromBuffer) {
                   // Add this request to the buffer, as it is not there yet.
                   runBuffer = runBuffer.enqueue(r)
-                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
-                  throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  val key = r.msg.activationId.toString
+                  var temp = mylog(key)
+                  temp = temp.updated("queueSize", runBuffer.size)
+                  temp = temp.updated("start", System.currentTimeMillis)
+                  mylog = mylog.updated(key , temp)
 
                   time_n = System.currentTimeMillis()
                 }
@@ -290,7 +299,15 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
             runBuffer = runBuffer.enqueue(r)
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runBuffer.size , "start" -> System.currentTimeMillis))
+            mylog += (r.msg.activationId.toString -> Map(
+              "action" -> r.action.name.name,
+              "namespace" -> r.msg.user.namespace.name,
+              "memory" -> r.action.limits.memory.megabytes.toInt,
+              "queueSize" -> runBuffer.size,
+              "start" -> System.currentTimeMillis,
+              "executionTime" -> r.time,
+              )
+            )
           }
 
         case "ETAS" =>
@@ -326,26 +343,6 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   }
               }
             }
-
-            /*
-            val lock_has_warm = ContainerPool.schedule(r.action, r.msg.user.namespace.name, freePool).getOrElse(false)
-            if(lock_has_warm == false) {
-              runActions.foreach {
-                case act =>
-                  if(!change_lock) {
-                    val warm = ContainerPool.schedule(act.r.action, act.r.msg.user.namespace.name, freePool).getOrElse(false)
-                    if (warm != false) {
-                      if (act.r.msg != lock.msg /*&& (act.r.time < 3000 || runActions.indexOf(act) < busyPool.size)*/) {
-                        change_lock = true
-                        is_lock = false
-                        lock = act.r
-                        lock_index = runActions.indexOf(act)
-                        self ! act.r
-                      }
-                    }
-                  }
-              }
-            }*/
           }
 
 
@@ -353,19 +350,22 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
           // next request to process
           // It is guaranteed, that only the first message on the buffer is resent.
           if (runActions2.isEmpty || is_lock) {
+
+            if(!mylog.exists(_._1 == r.msg.activationId.toString)){
+              mylog += (r.msg.activationId.toString -> Map(
+                "action" -> r.action.name.name,
+                "namespace" -> r.msg.user.namespace.name,
+                "memory" -> r.action.limits.memory.megabytes.toInt,
+                "queueSize" -> runActions2.size,
+                "start" -> System.currentTimeMillis,
+                "executionTime" -> r.time,
+                )
+              )
+            }
+
             val createdContainer =
             // Is there enough space on the invoker for this action to be executed.
               if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
-
-                if(mylog.exists(_._1 == r.msg.activationId.toString)){
-                  val key = r.msg.activationId.toString
-                  var temp = mylog(key)
-                  temp += ("end" -> System.currentTimeMillis)
-                  mylog = mylog.updated(key , temp)
-                }
-                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
-                  job += 1
-                }
 
                 // Schedule a job to a warm container
                 ContainerPool
@@ -398,16 +398,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
-                if(r.action.namespace.namespace != "whisk.system") {
-                  if (containers_state.exists(_._1 == containerState)) {
-                    val key = containerState
-                    var temp = containers_state(key)
-                    temp += 1
-                    containers_state = containers_state.updated(key, temp)
-                  } else {
-                    containers_state += (containerState -> 1)
-                  }
-                }
+
+                val key = r.msg.activationId.toString
+                var temp = mylog(key)
+                temp += ("containerState" -> containerState)
+                mylog = mylog.updated(key , temp)
 
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
@@ -431,6 +426,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   freePool = freePool + (actor -> newData)
                 }
 
+                temp = mylog(key)
+                temp += ("end" -> System.currentTimeMillis)
+                mylog = mylog.updated(key , temp)
+
                 actor ! r // forwards the run request to the container
                 logContainerStart(r, containerState, newData.activeActivationCount, container)
 
@@ -447,27 +446,22 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     self ! lock
                   }
                   else{
-                    logging.info(this, s"alii memory = ${poolConfig.userMemory.toMB}")
-
                     val system = ActorSystem("dbsave")
                     val dbsave = system.actorOf(Props[DbSave] , "dbsave")
                     dbsave ! log(mylog)
                     mylog = mylog.empty
 
-                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
-                    dbsave ! throughPut(throughPutLog)
-                    throughPutLog = throughPutLog.empty
-                    job = 0
-
-                    dbsave ! containerStateCount(containers_state)
-                    containers_state = containers_state.empty
-
-                    var new_resource = resource.clone()
+                    val new_resource = resource.clone()
                     dbsave ! resourceData(new_resource)
                     resource.clear()
 
                     lock_index = 0
                   }
+                }else if(mylog.nonEmpty){
+                  val system = ActorSystem("dbsave")
+                  val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                  dbsave ! log(mylog)
+                  mylog = mylog.empty
                 }
 
               case None =>
@@ -493,8 +487,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   // Add this request to the buffer, as it is not there yet.
                   runActions2 += act2(r, System.currentTimeMillis(), r.time, System.currentTimeMillis() + r.time)
                   lock = r
-                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions2.size , "start" -> System.currentTimeMillis()))
-                  throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  val key = r.msg.activationId.toString
+                  var temp = mylog(key)
+                  temp = temp.updated("queueSize", runActions2.size)
+                  temp = temp.updated("start", System.currentTimeMillis)
+                  mylog = mylog.updated(key , temp)
+
                   time_n = System.currentTimeMillis()
                 }
                 // As this request is the first one in the buffer, try again to execute it.
@@ -510,7 +509,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
             runActions2 += act2(r, System.currentTimeMillis(), r.time, System.currentTimeMillis() + r.time)
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions2.size , "start" -> System.currentTimeMillis()))
+
+            mylog += (r.msg.activationId.toString -> Map(
+              "action" -> r.action.name.name,
+              "namespace" -> r.msg.user.namespace.name,
+              "memory" -> r.action.limits.memory.megabytes.toInt,
+              "queueSize" -> runActions2.size,
+              "start" -> System.currentTimeMillis,
+              "executionTime" -> r.time,
+              )
+            )
           }
 
         case "BJF" =>
@@ -521,19 +529,22 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
           // next request to process
           // It is guaranteed, that only the first message on the buffer is resent.
           if (runActions.isEmpty || isResentFromBuffer) {
+
+            if(!mylog.exists(_._1 == r.msg.activationId.toString)){
+              mylog += (r.msg.activationId.toString -> Map(
+                "action" -> r.action.name.name,
+                "namespace" -> r.msg.user.namespace.name,
+                "memory" -> r.action.limits.memory.megabytes.toInt,
+                "queueSize" -> runActions.size,
+                "start" -> System.currentTimeMillis,
+                "executionTime" -> r.time,
+               )
+              )
+            }
+
             val createdContainer =
             // Is there enough space on the invoker for this action to be executed.
               if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
-
-                if(mylog.exists(_._1 == r.msg.activationId.toString)){
-                  val key = r.msg.activationId.toString
-                  var temp = mylog(key)
-                  temp += ("end" -> System.currentTimeMillis)
-                  mylog = mylog.updated(key , temp)
-                }
-                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
-                  job += 1
-                }
 
                 // Schedule a job to a warm container
                 ContainerPool
@@ -566,16 +577,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
-                if(r.action.namespace.namespace != "whisk.system") {
-                  if (containers_state.exists(_._1 == containerState)) {
-                    val key = containerState
-                    var temp = containers_state(key)
-                    temp += 1
-                    containers_state = containers_state.updated(key, temp)
-                  } else {
-                    containers_state += (containerState -> 1)
-                  }
-                }
+
+                val key = r.msg.activationId.toString
+                var temp = mylog(key)
+                temp += ("containerState" -> containerState)
+                mylog = mylog.updated(key , temp)
 
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
@@ -599,6 +605,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   freePool = freePool + (actor -> newData)
                 }
 
+                temp = mylog(key)
+                temp += ("end" -> System.currentTimeMillis)
+                mylog = mylog.updated(key , temp)
+
                 actor ! r // forwards the run request to the container
                 logContainerStart(r, containerState, newData.activeActivationCount, container)
 
@@ -617,18 +627,15 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! log(mylog)
                     mylog = mylog.empty
 
-                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
-                    dbsave ! throughPut(throughPutLog)
-                    throughPutLog = throughPutLog.empty
-                    job = 0
-
-                    dbsave ! containerStateCount(containers_state)
-                    containers_state = containers_state.empty
-
                     val new_resource = resource.clone()
                     dbsave ! resourceData(new_resource)
                     resource.clear()
                   }
+                }else if(mylog.nonEmpty){
+                  val system = ActorSystem("dbsave")
+                  val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                  dbsave ! log(mylog)
+                  mylog = mylog.empty
                 }
 
               case None =>
@@ -653,8 +660,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 if (!isResentFromBuffer) {
                   // Add this request to the buffer, as it is not there yet.
                   runActions += act(r, System.currentTimeMillis() + r.time)
-                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
-                  throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  val key = r.msg.activationId.toString
+                  var temp = mylog(key)
+                  temp = temp.updated("queueSize", runActions.size)
+                  temp = temp.updated("start", System.currentTimeMillis)
+                  mylog = mylog.updated(key , temp)
 
                   time_n = System.currentTimeMillis()
                 }
@@ -672,7 +683,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
             runActions += act(r, System.currentTimeMillis() + r.time)
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
+
+            mylog += (r.msg.activationId.toString -> Map(
+              "action" -> r.action.name.name,
+              "namespace" -> r.msg.user.namespace.name,
+              "memory" -> r.action.limits.memory.megabytes.toInt,
+              "queueSize" -> runActions.size,
+              "start" -> System.currentTimeMillis,
+              "executionTime" -> r.time,
+              )
+            )
           }
 
         case "SJF" =>
@@ -683,19 +703,22 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
           // next request to process
           // It is guaranteed, that only the first message on the buffer is resent.
           if (runActions.isEmpty || isResentFromBuffer) {
+
+            if(!mylog.exists(_._1 == r.msg.activationId.toString)){
+              mylog += (r.msg.activationId.toString -> Map(
+                "action" -> r.action.name.name,
+                "namespace" -> r.msg.user.namespace.name,
+                "memory" -> r.action.limits.memory.megabytes.toInt,
+                "queueSize" -> runActions.size,
+                "start" -> System.currentTimeMillis,
+                "executionTime" -> r.time,
+                )
+              )
+            }
+
             val createdContainer =
             // Is there enough space on the invoker for this action to be executed.
               if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
-
-                if(mylog.exists(_._1 == r.msg.activationId.toString)){
-                  val key = r.msg.activationId.toString
-                  var temp = mylog(key)
-                  temp += ("end" -> System.currentTimeMillis)
-                  mylog = mylog.updated(key , temp)
-                }
-                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
-                  job += 1
-                }
 
                 // Schedule a job to a warm container
                 ContainerPool
@@ -728,16 +751,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
-                if(r.action.namespace.namespace != "whisk.system") {
-                  if (containers_state.exists(_._1 == containerState)) {
-                    val key = containerState
-                    var temp = containers_state(key)
-                    temp += 1
-                    containers_state = containers_state.updated(key, temp)
-                  } else {
-                    containers_state += (containerState -> 1)
-                  }
-                }
+
+                val key = r.msg.activationId.toString
+                var temp = mylog(key)
+                temp += ("containerState" -> containerState)
+                mylog = mylog.updated(key , temp)
 
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
@@ -761,6 +779,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   freePool = freePool + (actor -> newData)
                 }
 
+
+                temp = mylog(key)
+                temp += ("end" -> System.currentTimeMillis)
+                mylog = mylog.updated(key , temp)
+
+
                 actor ! r // forwards the run request to the container
                 logContainerStart(r, containerState, newData.activeActivationCount, container)
 
@@ -779,18 +803,15 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     dbsave ! log(mylog)
                     mylog = mylog.empty
 
-                    throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
-                    dbsave ! throughPut(throughPutLog)
-                    throughPutLog = throughPutLog.empty
-                    job = 0
-
-                    dbsave ! containerStateCount(containers_state)
-                    containers_state = containers_state.empty
-
                     val new_resource = resource.clone()
                     dbsave ! resourceData(new_resource)
                     resource.clear()
                   }
+                }else if(mylog.nonEmpty){
+                  val system = ActorSystem("dbsave")
+                  val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                  dbsave ! log(mylog)
+                  mylog = mylog.empty
                 }
 
               case None =>
@@ -815,8 +836,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 if (!isResentFromBuffer) {
                   // Add this request to the buffer, as it is not there yet.
                   runActions += act(r, r.time)
-                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
-                  throughPutLog += ("startTime" -> System.currentTimeMillis)
+
+                  val key = r.msg.activationId.toString
+                  var temp = mylog(key)
+                  temp = temp.updated("queueSize", runActions.size)
+                  temp = temp.updated("start", System.currentTimeMillis)
+                  mylog = mylog.updated(key , temp)
 
                   time_n = System.currentTimeMillis()
                 }
@@ -834,7 +859,15 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
             runActions += act(r, r.time)
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> runActions.size , "start" -> System.currentTimeMillis))
+            mylog += (r.msg.activationId.toString -> Map(
+              "action" -> r.action.name.name,
+              "namespace" -> r.msg.user.namespace.name,
+              "memory" -> r.action.limits.memory.megabytes.toInt,
+              "queueSize" -> runActions.size,
+              "start" -> System.currentTimeMillis,
+              "executionTime" -> r.time,
+              )
+            )
           }
 
         case  "MQS" =>
@@ -842,24 +875,26 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
           val empty = actions.isEmpty && sActions.isEmpty && mActions.isEmpty && lActions.isEmpty
           val isLocked = !empty && lock.msg == r.msg
 
-
           // Only process request, if there are no other requests waiting for free slots, or if the current request is the
           // next request to process
           // It is guaranteed, that only the first message on the buffer is resent.
           if (empty || isLocked) {
+
+            if(!mylog.exists(_._1 == r.msg.activationId.toString)){
+              mylog += (r.msg.activationId.toString -> Map(
+                "action" -> r.action.name.name,
+                "namespace" -> r.msg.user.namespace.name,
+                "memory" -> r.action.limits.memory.megabytes.toInt,
+                "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size),
+                "start" -> System.currentTimeMillis,
+                "executionTime" -> r.time,
+                )
+              )
+            }
+
             val createdContainer =
             // Is there enough space on the invoker for this action to be executed.
               if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
-
-                if(mylog.exists(_._1 == r.msg.activationId.toString)){
-                  val key = r.msg.activationId.toString
-                  var temp = mylog(key)
-                  temp += ("end" -> System.currentTimeMillis)
-                  mylog = mylog.updated(key , temp)
-                }
-                if(throughPutLog.exists(_._1 == "startTime") && !throughPutLog.exists(_._1 == "endTime")){
-                  job += 1
-                }
 
                 // Schedule a job to a warm container
                 ContainerPool
@@ -892,16 +927,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
             createdContainer match {
               case Some(((actor, data), containerState)) =>
-                if(r.action.namespace.namespace != "whisk.system") {
-                  if (containers_state.exists(_._1 == containerState)) {
-                    val key = containerState
-                    var temp = containers_state(key)
-                    temp += 1
-                    containers_state = containers_state.updated(key, temp)
-                  } else {
-                    containers_state += (containerState -> 1)
-                  }
-                }
+
+                val key = r.msg.activationId.toString
+                var temp = mylog(key)
+                temp += ("containerState" -> containerState)
+                mylog = mylog.updated(key , temp)
 
                 //increment active count before storing in pool map
                 val newData = data.nextRun(r)
@@ -924,6 +954,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   //update freePool to track counts
                   freePool = freePool + (actor -> newData)
                 }
+
+                temp = mylog(key)
+                temp += ("end" -> System.currentTimeMillis)
+                mylog = mylog.updated(key , temp)
+
 
                 actor ! r // forwards the run request to the container
                 logContainerStart(r, containerState, newData.activeActivationCount, container)
@@ -1080,19 +1115,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                         dbsave ! log(mylog)
                         mylog = mylog.empty
 
-                        throughPutLog += ("endTime" -> System.currentTimeMillis() , "job" -> job)
-                        dbsave ! throughPut(throughPutLog)
-                        throughPutLog = throughPutLog.empty
-                        job = 0
-
-                        dbsave ! containerStateCount(containers_state)
-                        containers_state = containers_state.empty
-
-                        var new_resource = resource.clone()
+                        val new_resource = resource.clone()
                         dbsave ! resourceData(new_resource)
                         resource.clear()
                     }
                   }
+                }else if(mylog.nonEmpty){
+                  val system = ActorSystem("dbsave")
+                  val dbsave = system.actorOf(Props[DbSave] , "dbsave")
+                  dbsave ! log(mylog)
+                  mylog = mylog.empty
                 }
 
               case None =>
@@ -1120,8 +1152,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   lock = r
                   turn = "main"
 
-                  mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size) , "start" -> System.currentTimeMillis))
-                  throughPutLog += ("startTime" -> System.currentTimeMillis)
+                  val key = r.msg.activationId.toString
+                  var temp = mylog(key)
+                  temp = temp.updated("queueSize", (actions.size + sActions.size + mActions.size + lActions.size))
+                  temp = temp.updated("start", System.currentTimeMillis)
+                  mylog = mylog.updated(key , temp)
 
                   time_n = System.currentTimeMillis()
                 }
@@ -1140,7 +1175,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // There are currently actions waiting to be executed before this action gets executed.
             // These waiting actions were not able to free up enough memory.
             actions += r
-            mylog += (r.msg.activationId.toString -> Map("namespace" -> r.msg.user.namespace.name , "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size) , "start" -> System.currentTimeMillis))
+
+            mylog += (r.msg.activationId.toString -> Map(
+              "action" -> r.action.name.name,
+              "namespace" -> r.msg.user.namespace.name,
+              "memory" -> r.action.limits.memory.megabytes.toInt,
+              "queueSize" -> (actions.size + sActions.size + mActions.size + lActions.size),
+              "start" -> System.currentTimeMillis,
+              "executionTime" -> r.time,
+              )
+            )
           }
       }
 

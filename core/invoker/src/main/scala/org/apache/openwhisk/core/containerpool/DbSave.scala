@@ -25,12 +25,16 @@ class DbSave extends Actor{
   def receive: Receive = {
     case log(data) =>
       data.foreach(mylog => {
-        if(mylog._2.size == 4) {
+        if(mylog._2.size == 8) {
           val result = Map(
-            "namespace" -> JsString(mylog._2("namespace").toString),
+            "action" -> JsString(mylog._2("action").toString),
+            "user" -> JsString(mylog._2("namespace").toString),
+            "memory" -> JsString(mylog._2("memory").toString),
             "queueSize" -> JsString(mylog._2("queueSize").toString),
             "start" -> JsString(mylog._2("start").toString),
-            "end" -> JsString(mylog._2("end").toString)
+            "executionTime" -> JsString(mylog._2("executionTime").toString),
+            "end" -> JsString(mylog._2("end").toString),
+            "containerState" -> JsString(mylog._2("containerState").toString)
           )
           db("logging").putDoc(mylog._1, JsObject(result))
           logging.info(this, s"aliu log = ${result}")

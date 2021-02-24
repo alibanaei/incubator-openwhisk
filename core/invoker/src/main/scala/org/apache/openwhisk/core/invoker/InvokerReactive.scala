@@ -251,7 +251,7 @@ class InvokerReactive(
                   val rTime = resultProcess.getTime
 
 //                  val rTime = if(msg.content.nonEmpty) {
-//                    (msg.content.get.fields("number").toString.toInt)*1000
+//                    ((msg.content.get.fields("number").toString.toFloat)*1000).toInt
 //                  }else{
 //                    0
 //                  }
